@@ -106,4 +106,4 @@ darling@G7:~/dataset/pascal_voc/benchmark_RELEASE/dataset$ mv JPEGImages Segment
 - `tool/train.sh`中，第10行默认指定的conda的`test`运行环境，注意更改！
 - `config`中包含数据集的目录设置！
 - `config/voc2012/*` 在配置数据集时，`data_root`参数请配到包含`JPEGImages`与`SegmentationClassAug`的目录，本文直接通过软链方式衔接。
-- `initmodel`文件的下载，请访问[initmodel.tar.gz](https://download.csdn.net/download/u010516952/15991282)下载。
+- `initmodel`目录文件的下载（`resnet50_v2.pth`, `resnet101_v2.pth`, `resnet152_v2.pth`），请访问[initmodel.tar.gz](https://download.csdn.net/download/u010516952/15991282)。
