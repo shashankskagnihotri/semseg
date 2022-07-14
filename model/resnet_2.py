@@ -96,7 +96,7 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, num_classes=1000, deep_base=True):
+    def __init__(self, block, layers, num_classes=1000, deep_base=True, norm_layer=nn.BatchNorm2d):
         super(ResNet, self).__init__()
         self.deep_base = deep_base
         if not self.deep_base:
@@ -195,9 +195,9 @@ def resnet50(pretrained=False, **kwargs):
     """
     model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        # model.load_state_dict(model_zoo.load_url(model_urls['resnet50']))        
-        model_path = './model/initmodel/resnet50_v2.pth'
-        model.load_state_dict(torch.load(model_path), strict=False)
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet50']))
+        #model_path = './initmodel/resnet50_v2.pth'
+        #model.load_state_dict(torch.load(model_path), strict=False)
     return model
 
 

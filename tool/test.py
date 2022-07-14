@@ -12,7 +12,7 @@ import torch.nn.parallel
 import torch.utils.data
 
 from util import dataset, transform, config
-from util.util import AverageMeter, intersectionAndUnion, check_makedirs, colorize
+from util.util import AverageMeter, intersectionAndUnion, intersectionAndUnionGPU, check_makedirs, colorize
 
 cv2.ocl.setUseOpenCL(False)
 
@@ -60,6 +60,9 @@ def check(args):
                         args.mask_h <= 2 * ((args.train_h - 1) // (8 * args.shrink_factor) + 1) - 1)
                 assert (args.mask_w % 2 == 1) and (args.mask_w >= 3) and (
                         args.mask_w <= 2 * ((args.train_h - 1) // (8 * args.shrink_factor) + 1) - 1)
+    elif args.arch == 'unet':
+        assert (args.train_h) % 8 == 0 and (args.train_w) % 8 == 0
+        print("::::::::::::::::::   Using UNet   ::::::::::::::::::")
     else:
         raise Exception('architecture not supported yet'.format(args.arch))
 
@@ -67,6 +70,8 @@ def check(args):
 def main():
     global args, logger
     args = get_parser()
+    args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     check(args)
     logger = get_logger()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.test_gpu)
@@ -104,12 +109,26 @@ def main():
             model = PSANet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, compact=args.compact,
                            shrink_factor=args.shrink_factor, mask_h=args.mask_h, mask_w=args.mask_w,
                            normalization_factor=args.normalization_factor, psa_softmax=args.psa_softmax, pretrained=False)
+        elif args.arch == 'unet2':
+            from model.unet2 import UNet
+            model = UNet(num_classes=args.classes, in_dim=3, conv_dim=64)
+        elif args.arch == 'unet':
+            backbones = ['resnet18','resnet34','resnet50','resnet101','resnet152']
+            if args.backbone in backbones:
+                from model.unet import UNetResnet
+                model = UNetResnet(num_classes=args.classes,
+                                    in_channels=3, backbone=args.backbone,
+                                    pretrained=args.pretrained)            
+            else:
+                from model.unet import UNet
+                model = UNet(num_classes=args.classes, in_channelss=3)
         logger.info(model)
-        model = torch.nn.DataParallel(model).cuda()
+        #model = torch.nn.DataParallel(model).cuda()
+        model = torch.nn.DataParallel(model).to(args.device)
         cudnn.benchmark = True
         if os.path.isfile(args.model_path):
             logger.info("=> loading checkpoint '{}'".format(args.model_path))
-            checkpoint = torch.load(args.model_path)
+            checkpoint = torch.load(args.model_path, map_location=args.device)
             model.load_state_dict(checkpoint['state_dict'], strict=False)
             logger.info("=> loaded checkpoint '{}'".format(args.model_path))
         else:
@@ -127,7 +146,8 @@ def net_process(model, image, mean, std=None, flip=True):
     else:
         for t, m, s in zip(input, mean, std):
             t.sub_(m).div_(s)
-    input = input.unsqueeze(0).cuda()
+    #input = input.unsqueeze(0).cuda()
+    input = input.unsqueeze(0).to(args.device)
     if flip:
         input = torch.cat([input, input.flip(3)], 0)
     with torch.no_grad():
@@ -204,7 +224,7 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
         prediction = np.argmax(prediction, axis=2)
         batch_time.update(time.time() - end)
         end = time.time()
-        if ((i + 1) % 10 == 0) or (i + 1 == len(test_loader)):
+        if ((i + 1) % 100 == 0) or (i + 1 == len(test_loader)):
             logger.info('Test: [{}/{}] '
                         'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
                         'Batch {batch_time.val:.3f} ({batch_time.avg:.3f}).'.format(i + 1, len(test_loader),
@@ -232,7 +252,10 @@ def cal_acc(data_list, pred_folder, classes, names):
         image_name = image_path.split('/')[-1].split('.')[0]
         pred = cv2.imread(os.path.join(pred_folder, image_name+'.png'), cv2.IMREAD_GRAYSCALE)
         target = cv2.imread(target_path, cv2.IMREAD_GRAYSCALE)
+        #if 'cpu' == torch.device('cuda' if torch.cuda.is_available() else 'cpu').type:
         intersection, union, target = intersectionAndUnion(pred, target, classes)
+        #else:
+        #    intersection, union, target = intersectionAndUnionGPU(pred, target, classes)
         intersection_meter.update(intersection)
         union_meter.update(union)
         target_meter.update(target)

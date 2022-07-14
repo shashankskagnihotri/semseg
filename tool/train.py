@@ -18,7 +18,7 @@ import torch.distributed as dist
 from tensorboardX import SummaryWriter
 
 from util import dataset, transform, config
-from util.util import AverageMeter, poly_learning_rate, intersectionAndUnionGPU, find_free_port
+from util.util import AverageMeter, poly_learning_rate, intersectionAndUnion, intersectionAndUnionGPU, find_free_port
 
 cv2.ocl.setUseOpenCL(False)
 cv2.setNumThreads(0)
@@ -84,7 +84,7 @@ def check(args):
 
 def main():
     args = get_parser()
-    check(args)
+    check(args)    
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
     if args.manual_seed is not None:
         random.seed(args.manual_seed)
@@ -114,41 +114,83 @@ def main():
 def main_worker(gpu, ngpus_per_node, argss):
     global args
     args = argss
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    args.device=device
     if args.distributed:
         if args.dist_url == "env://" and args.rank == -1:
             args.rank = int(os.environ["RANK"])
         if args.multiprocessing_distributed:
             args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size, rank=args.rank)
+        dist.init_process_group(backend=args.dist_backend, 
+                                init_method=args.dist_url, 
+                                world_size=args.world_size, 
+                                rank=args.rank)
 
     criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
     if args.arch == 'psp':
         from model.pspnet import PSPNet
-        model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, criterion=criterion)
-        modules_ori = [model.layer0, model.layer1, model.layer2, model.layer3, model.layer4]
+        model = PSPNet(layers=args.layers, classes=args.classes, 
+                        zoom_factor=args.zoom_factor, criterion=criterion)
+        modules_ori = [model.layer0, model.layer1, model.layer2, 
+                        model.layer3, model.layer4]
         modules_new = [model.ppm, model.cls, model.aux]
     elif args.arch == 'psa':
         from model.psanet import PSANet
-        model = PSANet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, psa_type=args.psa_type,
-                       compact=args.compact, shrink_factor=args.shrink_factor, mask_h=args.mask_h, mask_w=args.mask_w,
-                       normalization_factor=args.normalization_factor, psa_softmax=args.psa_softmax, criterion=criterion)
-        modules_ori = [model.layer0, model.layer1, model.layer2, model.layer3, model.layer4]
+        model = PSANet(layers=args.layers, classes=args.classes, 
+                        zoom_factor=args.zoom_factor, psa_type=args.psa_type, 
+                        compact=args.compact, shrink_factor=args.shrink_factor, 
+                        mask_h=args.mask_h, mask_w=args.mask_w, 
+                        normalization_factor=args.normalization_factor, 
+                        psa_softmax=args.psa_softmax, criterion=criterion)
+        modules_ori = [model.layer0, model.layer1, model.layer2, 
+                        model.layer3, model.layer4]
         modules_new = [model.psa, model.cls, model.aux]
     elif args.arch == 'unet':
-        from model.unet import UNet
-        model = UNet(num_classes=args.classes, in_dim=3, conv_dim=64, criterion=criterion)
-        modules_ori=[model.enc1, model.enc2, model.enc3, model.enc4, model.dec1, model.dec2, model.dec3, model.dec4]
-        modules_new=[model.last]
+        backbones = ['resnet18','resnet34','resnet50','resnet101','resnet152']
+        if args.backbone in backbones:
+            from model.unet import UNetResnet
+            model = UNetResnet(num_classes=args.classes,
+                                in_channels=3, backbone=args.backbone,
+                                pretrained=args.pretrained,
+                                criterion=criterion)
+            modules_ori=[model.initial, model.layer1, model.layer2, 
+                        model.layer3, model.layer4]
+            #modules_new=[model.decoder1, model.upconv1, model.decoder2, 
+            #            model.upconv2, model.decoder3, model.upconv3, 
+            #            model.decoder4, model.upconv4, model.last]
+            modules_new=[model.decoder1, model.decoder2, 
+                        model.decoder3, model.decoder4, model.last]
+        else:
+            from model.unet import UNet
+            model = UNet(num_classes=args.classes, in_channelss=3, criterion=criterion)
+            #model = UNet(num_classes=args.classes, in_dim=3, conv_dim=64, criterion=criterion)
+            #modules_ori=[model.enc1, model.enc2, model.enc3, model.enc4, model.dec1, model.dec2, model.dec3, model.dec4]
+            #modules_new=[model.last]
+            modules_ori=[model.start_conv, model.down1, 
+                        model.down2, model.down3, model.down4]
+            modules_new=[model.middle_conv, model.up1, model.up2,
+                        model.up3, model.up4, model.final_conv]
+    elif args.arch == 'unet2':
+        from model.unet2 import UNet
+        model = UNet(num_classes=args.classes, in_dim=3, conv_dim=64)
+        modules_ori=[model.enc1, model.enc2, 
+                    model.enc3, model.enc4]
+        modules_new=[model.dec1, model.dec2, model.dec3,
+                    model.dec4, model.last]
+    else:
+        raise Exception('architecture not supported yet'.format(args.arch))
     params_list = []
     for module in modules_ori:
-        if args.arch=='unet':
+        if args.arch=='unet' and args.backbone not in backbones:
             params_list.append(dict(params=module.parameters(), lr=args.base_lr*10))
         else:
             params_list.append(dict(params=module.parameters(), lr=args.base_lr))
     for module in modules_new:
         params_list.append(dict(params=module.parameters(), lr=args.base_lr * 10))
     args.index_split = 5
-    optimizer = torch.optim.SGD(params_list, lr=args.base_lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(params_list, lr=args.base_lr, 
+                                momentum=args.momentum, 
+                                weight_decay=args.weight_decay)
     if args.sync_bn:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
@@ -165,9 +207,11 @@ def main_worker(gpu, ngpus_per_node, argss):
         args.batch_size = int(args.batch_size / ngpus_per_node)
         args.batch_size_val = int(args.batch_size_val / ngpus_per_node)
         args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-        model = torch.nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[gpu])
+        #model = torch.nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model.to(args.device))#, device_ids=[gpu])
     else:
-        model = torch.nn.DataParallel(model.cuda())
+        #model = torch.nn.DataParallel(model.cuda())
+        model = torch.nn.DataParallel(model.to(args.device))
 
     if args.weight:
         if os.path.isfile(args.weight):
@@ -182,11 +226,16 @@ def main_worker(gpu, ngpus_per_node, argss):
                 logger.info("=> no weight found at '{}'".format(args.weight))
 
     if args.resume:
+        logger.info("\n\n\n:::::::::::::::::::::   RESUMING TRAINGING   :::::::::::::::::::::\n\n\n")
         if os.path.isfile(args.resume):
             if main_process():
                 logger.info("=> loading checkpoint '{}'".format(args.resume))
             # checkpoint = torch.load(args.resume)
-            checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage.cuda())
+            if args.device.type == 'cpu':
+                checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage)
+            else:
+                checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage.cuda())
+            #checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage.to(args.device))
             args.start_epoch = checkpoint['epoch']
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -204,29 +253,42 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     train_transform = transform.Compose([
         transform.RandScale([args.scale_min, args.scale_max]),
-        transform.RandRotate([args.rotate_min, args.rotate_max], padding=mean, ignore_label=args.ignore_label),
+        transform.RandRotate([args.rotate_min, args.rotate_max], padding=mean, 
+                                ignore_label=args.ignore_label),
         transform.RandomGaussianBlur(),
         transform.RandomHorizontalFlip(),
-        transform.Crop([args.train_h, args.train_w], crop_type='rand', padding=mean, ignore_label=args.ignore_label),
+        transform.Crop([args.train_h, args.train_w], crop_type='rand', 
+                        padding=mean, ignore_label=args.ignore_label),
         transform.ToTensor(),
         transform.Normalize(mean=mean, std=std)])
-    train_data = dataset.SemData(split='train', data_root=args.data_root, data_list=args.train_list, transform=train_transform)
+    train_data = dataset.SemData(split='train', data_root=args.data_root, 
+                                data_list=args.train_list, 
+                                transform=train_transform)
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
     else:
         train_sampler = None
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, 
+                                                shuffle=(train_sampler is None), 
+                                                num_workers=args.workers, pin_memory=True, 
+                                                sampler=train_sampler, drop_last=True)
     if args.evaluate:
         val_transform = transform.Compose([
-            transform.Crop([args.train_h, args.train_w], crop_type='center', padding=mean, ignore_label=args.ignore_label),
-            transform.ToTensor(),
-            transform.Normalize(mean=mean, std=std)])
-        val_data = dataset.SemData(split='val', data_root=args.data_root, data_list=args.val_list, transform=val_transform)
+            transform.Crop([args.train_h, args.train_w], crop_type='center', 
+                            padding=mean, ignore_label=args.ignore_label),
+                            transform.ToTensor(),
+                            transform.Normalize(mean=mean, std=std)])
+        val_data = dataset.SemData(split='val', data_root=args.data_root, 
+                                    data_list=args.val_list, 
+                                    transform=val_transform)
         if args.distributed:
             val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
         else:
             val_sampler = None
-        val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=False, num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+        val_loader = torch.utils.data.DataLoader(val_data, 
+                            batch_size=args.batch_size_val, shuffle=False, 
+                            num_workers=args.workers, pin_memory=True, 
+                            sampler=val_sampler)
 
     for epoch in range(args.start_epoch, args.epochs):
         epoch_log = epoch + 1
@@ -242,10 +304,12 @@ def main_worker(gpu, ngpus_per_node, argss):
         if (epoch_log % args.save_freq == 0) and main_process():
             filename = args.save_path + '/train_epoch_' + str(epoch_log) + '.pth'
             logger.info('Saving checkpoint to: ' + filename)
-            torch.save({'epoch': epoch_log, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, filename)
+            torch.save({'epoch': epoch_log, 'state_dict': model.state_dict(), 
+                        'optimizer': optimizer.state_dict()}, filename)
             if epoch_log / args.save_freq > 2:
                 deletename = args.save_path + '/train_epoch_' + str(epoch_log - args.save_freq * 2) + '.pth'
-                os.remove(deletename)
+                if not epoch_log == 501 or epoch_log == 502:
+                    os.remove(deletename)
         if args.evaluate:
             loss_val, mIoU_val, mAcc_val, allAcc_val = validate(val_loader, model, criterion)
             if main_process():
@@ -273,23 +337,37 @@ def train(train_loader, model, optimizer, epoch):
         if args.zoom_factor != 8:
             h = int((target.size()[1] - 1) / 8 * args.zoom_factor + 1)
             w = int((target.size()[2] - 1) / 8 * args.zoom_factor + 1)
-            # 'nearest' mode doesn't support align_corners mode and 'bilinear' mode is fine for downsampling
-            target = F.interpolate(target.unsqueeze(1).float(), size=(h, w), mode='bilinear', align_corners=True).squeeze(1).long()
-        input = input.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
-        if args.arch=='unet':
+            # 'nearest' mode doesn't support align_corners mode and 
+            # 'bilinear' mode is fine for downsampling
+            target = F.interpolate(target.unsqueeze(1).float(), 
+                                    size=(h, w), mode='bilinear', 
+                                    align_corners=True).squeeze(1).long()
+        #input = input.cuda(non_blocking=True)
+        #target = target.cuda(non_blocking=True)
+        input = input.to(args.device)
+        target = target.to(args.device)
+        #import ipdb;ipdb.set_trace()
+        if args.arch=='unet':            
             output = model(input)
             loss = model.module.criterion(output, target)
+            
+            #print("intput: ", torch.mean(input))
+            #print("output: ", torch.mean(output))
+            
             output = torch.argmax(output, dim=1)
+            #output1 = output.max(1)[1]
+            #import ipdb;ipdb.set_trace()
             aux_loss=torch.zeros(1)
             if not args.multiprocessing_distributed:
                 loss, aux_loss = torch.mean(loss), torch.mean(aux_loss)
             main_loss=loss
         else:
             output, main_loss, aux_loss = model(input, target)
+            #print("intput: ", torch.mean(input))
+            #print("output: ", np.mean(output.clone().numpy()))
             if not args.multiprocessing_distributed:
                 main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
-            loss = main_loss + args.aux_weight * aux_loss
+            loss = main_loss + args.aux_weight * aux_loss       
 
         optimizer.zero_grad()
         loss.backward()
@@ -303,10 +381,15 @@ def train(train_loader, model, optimizer, epoch):
             n = count.item()
             main_loss, aux_loss, loss = main_loss / n, aux_loss / n, loss / n
 
-        intersection, union, target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
+        #import ipdb;ipdb.set_trace()
+        if 'cpu'==torch.device('cuda' if torch.cuda.is_available() else 'cpu').type:
+            intersection, union, target = intersectionAndUnion(output, target, args.classes, args.ignore_label)    
+        else:
+            intersection, union, target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
         if args.multiprocessing_distributed:
             dist.all_reduce(intersection), dist.all_reduce(union), dist.all_reduce(target)
-        intersection, union, target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy()
+        if not 'cpu'==torch.device('cuda' if torch.cuda.is_available() else 'cpu').type:
+            intersection, union, target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy()
         intersection_meter.update(intersection), union_meter.update(union), target_meter.update(target)
 
         accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
@@ -374,8 +457,10 @@ def validate(val_loader, model, criterion):
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
         data_time.update(time.time() - end)
-        input = input.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        #input = input.cuda(non_blocking=True)
+        #target = target.cuda(non_blocking=True)
+        input = input.to(args.device)
+        target = target.to(args.device)
         output = model(input)
         if args.zoom_factor != 8:
             output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)

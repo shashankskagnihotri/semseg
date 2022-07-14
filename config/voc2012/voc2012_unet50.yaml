@@ -6,6 +6,8 @@ DATA:
 
 TRAIN:
   arch: unet
+  backbone: resnet50
+  pretrained: True
   layers: 50
   sync_bn: True  # adopt sync_bn or not
   train_h: 256
@@ -20,22 +22,22 @@ TRAIN:
   train_gpu: [0]
   #train_gpu: [0, 1]
   #train_gpu: [0, 1, 2, 3] 
-  workers: 1  # data loader workers
+  workers: 64  # data loader workers
   batch_size: 16  # batch size for training
   batch_size_val: 8  # batch size for validation during training, memory and speed tradeoff
   base_lr: 0.01
-  epochs: 50
+  epochs: 250
   start_epoch: 0
   power: 0.9
   momentum: 0.9
   weight_decay: 0.0001
   manual_seed:
-  print_freq: 10
+  print_freq: 100
   save_freq: 1
-  save_path: exp/voc2012/unet50/model
+  save_path: exp/voc2012/unet250_resnet_pretrained_lr_0.01/model
   weight:  # path to initial weight (default: none)
-  resume:  # path to latest checkpoint (default: none)
-  evaluate: False  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
+  resume:  #exp/voc2012/unet500_pretrained/model/train_epoch_500.pth
+  evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
 Distributed:
   dist_url: tcp://127.0.0.1:6789
   dist_backend: 'nccl'
@@ -54,7 +56,7 @@ TEST:
   index_start: 0  # evaluation start index in list
   index_step: 0  # evaluation step index in list, 0 means to end
   test_gpu: [0]
-  model_path: exp/voc2012/unet50/model/train_epoch_50.pth  # evaluation model path
-  save_folder: exp/voc2012/unet50/result/epoch_50/val/ss  # results save folder
+  model_path: exp/voc2012/unet1000_pretrained/model/train_epoch_500.pth  # evaluation model path
+  save_folder: exp/voc2012/unet1000_pretrained/epoch_601/val/ss  # results save folder
   colors_path: data/voc2012/voc2012_colors.txt  # path of dataset colors
   names_path: data/voc2012/voc2012_names.txt  # path of dataset category names
