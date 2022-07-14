@@ -348,12 +348,17 @@ class UNetResnet(BaseModel):
 """
 
 class UNetConvNeXt(BaseModel):
-    def __init__(self, num_classes, in_channels=3, backbone='convnext_tiny', pretrained=True, 
-                    freeze_bn=False, freeze_backbone=False,**_):
+    def __init__(self, num_classes, in_channels=3, backbone='convnext_tiny', 
+                pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
+                freeze_bn=False, freeze_backbone=False,**_):
         super(UNetConvNeXt, self).__init__()
-        model = getattr(convnext, backbone)(pretrained=pretrained, prune_dims=prune_dims)
+        
+        self.criterion = criterion
+        model = getattr(convnext, backbone)(pretrained=pretrained)
+        base_width = model.head.in_features
 
-        self.initial = list(model.children())[:1]
+        #self.initial = list(model.children())[:1]
+        self.initial = list(model.downsample_layers[0])
         #TODO: get only the head here and modify it similar to resnet50
         
         if in_channels != 3:
@@ -362,9 +367,9 @@ class UNetConvNeXt(BaseModel):
 
         # encoder
         self.layer1 = model.stages[0]
-        self.layer2 = model.stages[1]
-        self.layer3 = model.stages[2]
-        self.layer4 = model.stages[3]
+        self.layer2 = nn.Sequential(model.downsample_layers[1], model.stages[1])
+        self.layer3 = nn.Sequential(model.downsample_layers[2], model.stages[2])
+        self.layer4 = nn.Sequential(model.downsample_layers[3], model.stages[3])
 
         # decoder 
         """
@@ -376,16 +381,19 @@ class UNetConvNeXt(BaseModel):
         self.decoder3 = decoder_resnet(int(base_width/4), int(base_width/4))
         self.decoder4 = decoder_resnet(int(base_width/8), int(base_width/8))
         #self.decoder4 = decoder(int(base_width/16), int(base_width/32))
-        self.last = nn.Sequential(OrderedDict([("up", nn.ConvTranspose2d(int(base_width/8), 
+        self.last = nn.Sequential(OrderedDict([
+                                ("conv", nn.Conv2d(int(base_width/4), 
+                                int(base_width/8), kernel_size=1)),
+                                ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/8)))),
+                                ("lastup", nn.ConvTranspose2d(int(base_width/8),
+                                    int(base_width/8), kernel_size=4, stride=4)),
+                                ("out", nn.Conv2d(int(base_width/8), 
+                                num_classes, kernel_size=1))]))
+        """
+                                ("up", nn.ConvTranspose2d(int(base_width/8), 
                                             int(base_width/32), 
                                             kernel_size=1, stride=1)),
-                                ("conv", nn.Conv2d(int(base_width/16), 
-                                int(base_width/32), kernel_size=1)),
-                                ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/32)))),
-                                ("lastup", nn.ConvTranspose2d(int(base_width/32),
-                                    int(base_width/32), kernel_size=4, stride=4)),
-                                ("out", nn.Conv2d(int(base_width/32), 
-                                num_classes, kernel_size=1))]))
+        """
 
         if pretrained:
             print(":::::::::>>>>>>>       INITIALIZING ONLY THE DECODER")
@@ -432,7 +440,7 @@ class UNetConvNeXt(BaseModel):
         x = self.decoder4(x1, x)
         #x = self.upconv4(x)
 
-        x = self.last.up(x)        
+        #x = self.last.up(x)        
         x = torch.cat([x0, x], dim=1)
         x = self.last.norm(self.last.conv(x))
         x = self.last.lastup(x)

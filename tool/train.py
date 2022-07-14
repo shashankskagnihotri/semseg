@@ -147,6 +147,8 @@ def main_worker(gpu, ngpus_per_node, argss):
         modules_new = [model.psa, model.cls, model.aux]
     elif args.arch == 'unet':
         backbones = ['resnet18','resnet34','resnet50','resnet101','resnet152']
+        convnext_backbones = ['convnext_tiny', 'convnext_small', 'convnext_base', 
+                                'convnext_large', 'convnext_xlarge']
         if args.backbone in backbones:
             from model.unet import UNetResnet
             model = UNetResnet(num_classes=args.classes,
@@ -160,6 +162,17 @@ def main_worker(gpu, ngpus_per_node, argss):
             #            model.decoder4, model.upconv4, model.last]
             modules_new=[model.decoder1, model.decoder2, 
                         model.decoder3, model.decoder4, model.last]
+        elif args.backbone in convnext_backbones:
+            from model.unet import UNetConvNeXt
+            model = UNetConvNeXt(num_classes=args.classes,
+                                in_channels=3, backbone=args.backbone,
+                                pretrained=args.pretrained,
+                                criterion=criterion)
+            modules_ori=[model.initial, model.layer1, model.layer2, 
+                        model.layer3, model.layer4]
+            modules_new=[model.decoder1, model.decoder2, 
+                        model.decoder3, model.decoder4, model.last]
+
         else:
             from model.unet import UNet
             model = UNet(num_classes=args.classes, in_channelss=3, criterion=criterion)
