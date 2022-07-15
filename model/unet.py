@@ -58,7 +58,7 @@ class encoder(nn.Module):
 class decoder(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(decoder, self).__init__()
-        self.up = nn.ConvTranspose2d(in_channels*2, in_channels, kernel_size=2, stride=2)
+        self.up = nn.ConvTranspose2d(in_channels, in_channels//2, kernel_size=2, stride=2)
         self.up_conv = x2conv(in_channels, out_channels)
 
     def forward(self, x_copy, x, interpolate=True):

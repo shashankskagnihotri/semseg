@@ -8,6 +8,8 @@ TRAIN:
   arch: unet
   backbone: resnet50
   pretrained: True
+  optimizer: sgd
+  criterion: cross_entropy
   layers: 50
   sync_bn: True  # adopt sync_bn or not
   train_h: 256
@@ -34,7 +36,7 @@ TRAIN:
   manual_seed:
   print_freq: 100
   save_freq: 1
-  save_path: exp/voc2012/unet250_resnet_pretrained_lr_0.01/model
+  save_path: exp/voc2012/testing/model
   weight:  # path to initial weight (default: none)
   resume:  #exp/voc2012/unet500_pretrained/model/train_epoch_500.pth
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend

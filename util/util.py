@@ -6,6 +6,26 @@ import torch
 from torch import nn
 import torch.nn.init as initer
 
+class MSELoss(torch.nn.MSELoss):
+    """Computes and stores the average and current value"""
+    def __init__(self, ignore_index, reduction=None):
+        super(torch.nn.MSELoss, self).__init__(None, None, reduction)
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        #self.out=torch.nn.Parameter()
+
+    def forward(self, input, target):
+        mask = target == self.ignore_index
+        input = torch.argmax(input, dim=1)
+        out = (input[~mask]-target[~mask])**2
+        out = out.type(torch.FloatTensor)
+        out.requires_grad=True
+        if self.reduction == "mean":
+            return out.mean()
+        elif self.reduction == "sum":
+            return torch.sum(out)
+        else:
+            return out
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -23,7 +43,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
 
 def step_learning_rate(base_lr, epoch, step_epoch, multiplier=0.1):
     """Sets the learning rate to the base LR decayed by 10 every step epochs"""

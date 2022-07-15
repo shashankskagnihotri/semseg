@@ -18,7 +18,7 @@ import torch.distributed as dist
 from tensorboardX import SummaryWriter
 
 from util import dataset, transform, config
-from util.util import AverageMeter, poly_learning_rate, intersectionAndUnion, intersectionAndUnionGPU, find_free_port
+from util.util import MSELoss, AverageMeter, poly_learning_rate, intersectionAndUnion, intersectionAndUnionGPU, find_free_port
 
 cv2.ocl.setUseOpenCL(False)
 cv2.setNumThreads(0)
@@ -126,7 +126,10 @@ def main_worker(gpu, ngpus_per_node, argss):
                                 world_size=args.world_size, 
                                 rank=args.rank)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
+    if hasattr(args, 'criterion') and ('mse' in args.criterion):
+        criterion = MSELoss(ignore_index=args.ignore_label)
+    else:
+        criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
     if args.arch == 'psp':
         from model.pspnet import PSPNet
         model = PSPNet(layers=args.layers, classes=args.classes, 
@@ -201,9 +204,13 @@ def main_worker(gpu, ngpus_per_node, argss):
     for module in modules_new:
         params_list.append(dict(params=module.parameters(), lr=args.base_lr * 10))
     args.index_split = 5
-    optimizer = torch.optim.SGD(params_list, lr=args.base_lr, 
-                                momentum=args.momentum, 
-                                weight_decay=args.weight_decay)
+    if hasattr(args, 'optimizer') and args.optimizer == 'adam':
+        optimizer = torch.optim.Adam(params_list, lr=args.base_lr,                                     
+                                    weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.SGD(params_list, lr=args.base_lr, 
+                                    momentum=args.momentum, 
+                                    weight_decay=args.weight_decay)
     if args.sync_bn:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
