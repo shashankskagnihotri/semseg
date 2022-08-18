@@ -11,9 +11,10 @@ from model import resnet_2
 from model import inverse_resnet
 from timm.models.layers import trunc_normal_, DropPath
 from timm.models.registry import register_model
-from model import convnext
+from model import convnext, SLaK
 import torchvision.models
 from collections import OrderedDict
+import math
 
 
 
@@ -84,8 +85,10 @@ class decoder(nn.Module):
 class decoder_resnet(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(decoder_resnet, self).__init__()
-        self.up = nn.ConvTranspose2d(in_channels*2, in_channels, kernel_size=2, stride=2)
-        self.up_conv = backbone_conv(in_channels, out_channels)
+        pos1=int(in_channels*2)
+        pos2=int(in_channels)
+        self.up = nn.ConvTranspose2d(pos1, pos2, kernel_size=2, stride=2)
+        self.up_conv = backbone_conv(int(in_channels), out_channels)
 
     def forward(self, x_copy, x, interpolate=True):       
         # Concatenate
@@ -455,6 +458,134 @@ class UNetConvNeXt(BaseModel):
         return chain(self.conv1.parameters(), self.upconv1.parameters(), self.conv2.parameters(), self.upconv2.parameters(),
                     self.conv3.parameters(), self.upconv3.parameters(), self.conv4.parameters(), self.upconv4.parameters(),
                     self.conv5.parameters(), self.upconv5.parameters(), self.conv6.parameters(), self.conv7.parameters())
+
+    def freeze_bn(self):
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm2d): module.eval()
+
+
+"""
+-> Unet with a SLaK backbone
+    SLaK
+        A PyTorch impl of : 
+        More ConvNets in the 2020s: Scaling up Kernels Beyond 51 x 51 using Sparsity  -
+          https://arxiv.org/abs/2207.03620
+"""
+
+class UNetSLaK(BaseModel):
+    def __init__(self, num_classes, in_channels=3, backbone='SLaK_tiny', 
+                pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
+                drop_path_rate=0.0, kernel_size=[51,49,47,13,5], width_factor=1.3, Decom=True,
+                bn=True, freeze_bn=False, freeze_backbone=False,**_):
+        super(UNetSLaK, self).__init__()
+        
+        self.criterion = criterion
+        model = getattr(SLaK, backbone)(drop_path_rate=drop_path_rate, kernel_size=kernel_size,
+                                        width_factor=width_factor, Decom=Decom, bn=bn)
+        if pretrained:
+            if 'tiny' in backbone:
+                checkpoint = torch.load("/work/ws-tmp/sa058646-segment/SLaK/models/SLaK_tiny_checkpoint.pth", map_location=torch.device('cpu'))['model']
+            elif 'small' in backbone:
+                checkpoint = torch.load("/work/ws-tmp/sa058646-segment/SLaK/models/SLaK_small_checkpoint.pth", map_location=torch.device('cpu'))['model']
+            elif 'base' in backbone:
+                checkpoint = torch.load("/work/ws-tmp/sa058646-segment/SLaK/models/SLaK_base_checkpoint.pth", map_location=torch.device('cpu'))['model']
+            else:
+                raise NotImplementedError('pretrained specified for an architecture that is not supported!')
+            model.load_state_dict(checkpoint)
+        base_width = model.head.in_features
+        self.base_width=base_width
+        
+        self.initial = list(model.downsample_layers[0])  
+        
+        if in_channels != 3:
+            self.initial[0] = nn.Conv2d(in_channels, 96, kernel_size=4, stride=4, padding=0, bias=False)
+        self.initial = nn.Sequential(*self.initial)
+
+        # encoder
+        self.layer1 = model.stages[0]
+        self.layer2 = nn.Sequential(model.downsample_layers[1], model.stages[1])
+        self.layer3 = nn.Sequential(model.downsample_layers[2], model.stages[2])
+        self.layer4 = nn.Sequential(model.downsample_layers[3], model.stages[3])
+
+        # decoder         
+        self.decoder1 = x2conv(int(base_width), int(base_width))
+        self.decoder2 = decoder_resnet(base_width/2, int(base_width/2))
+        self.decoder3 = decoder_resnet(base_width/4, int(base_width/4))
+        self.decoder4 = decoder_resnet(base_width/8, int(base_width/8))
+    
+        self.last = nn.Sequential(OrderedDict([
+                                ("conv", nn.Conv2d(int(base_width/8)*2, 
+                                int(base_width/8), kernel_size=1)),
+                                ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/8)))),
+                                ("lastup", nn.ConvTranspose2d(int(base_width/8),
+                                    int(base_width/8), kernel_size=4, stride=4)),
+                                ("out", nn.Conv2d(int(base_width/8), 
+                                num_classes, kernel_size=1))]))
+        """
+                                ("up", nn.ConvTranspose2d(int(base_width/8), 
+                                            int(base_width/32), 
+                                            kernel_size=1, stride=1)),
+        """
+
+        if pretrained:
+            print(":::::::::>>>>>>>       INITIALIZING ONLY THE DECODER")
+            decoder = [self.decoder1, self.decoder2, self.decoder3,
+                        self.decoder4, self.last]#, self.middle]
+            for dec in decoder:
+                initialize_weights(dec)
+        else:
+            print(":::::::::>>>>>>>       INITIALIZING THE WHOLE ARCHITECTURE")
+            initialize_weights(self)
+
+        if freeze_bn:
+            self.freeze_bn()
+        if freeze_backbone: 
+            set_trainable([self.initial, self.layer1, self.layer2, self.layer3, self.layer4], False)
+
+    def forward(self, x):
+        # encoding
+        x0 = self.initial(x)
+        x1 = self.layer1(x0)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
+        #x5 = self.middle(x4)
+
+        #decoding
+        #import ipdb;ipdb.set_trace()
+        x = self.decoder1(x4)        
+        #x = self.upconv1(x)
+        
+        #x = torch.cat([x3, x], dim=1)
+
+        x = self.decoder2(x3, x)
+        #x = self.upconv2(x)
+        
+        #import ipdb;ipdb.set_trace()
+        #x = torch.cat([x2, x], dim=1)
+
+        x = self.decoder3(x2, x)
+        #x = self.upconv3(x)
+        
+        #x = torch.cat([x1, x], dim=1)
+
+        x = self.decoder4(x1, x)
+        #x = self.upconv4(x)
+
+        #x = self.last.up(x)        
+        x = torch.cat([x0, x], dim=1)
+        x = self.last.norm(self.last.conv(x))
+        x = self.last.lastup(x)
+        x = self.last.out(x)
+        return x
+
+    def get_backbone_params(self):
+        return chain(self.initial.parameters(), self.layer1.parameters(), self.layer2.parameters(), 
+                    self.layer3.parameters(), self.layer4.parameters())
+
+    def get_decoder_params(self):
+        return chain(self.decoder1.parameters(), self.decoder2.parameters(), self.decoder3.parameters(), 
+                    self.decoder4.parameters(), self.last.parameters())
 
     def freeze_bn(self):
         for module in self.modules():

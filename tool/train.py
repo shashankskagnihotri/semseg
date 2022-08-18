@@ -100,7 +100,7 @@ def main():
     args.ngpus_per_node = len(args.train_gpu)
     if len(args.train_gpu) == 1:
         args.sync_bn = False
-        args.distributed = False
+        args.distributed = True if 'SLaK' in args.backbone else False
         args.multiprocessing_distributed = False
     if args.multiprocessing_distributed:
         port = find_free_port()
@@ -115,7 +115,7 @@ def main_worker(gpu, ngpus_per_node, argss):
     global args
     args = argss
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    args.device=device
+    args.device=device    
     if args.distributed:
         if args.dist_url == "env://" and args.rank == -1:
             args.rank = int(os.environ["RANK"])
@@ -152,6 +152,7 @@ def main_worker(gpu, ngpus_per_node, argss):
         backbones = ['resnet18','resnet34','resnet50','resnet101','resnet152']
         convnext_backbones = ['convnext_tiny', 'convnext_small', 'convnext_base', 
                                 'convnext_large', 'convnext_xlarge']
+        slak_backbones = ['SLaK_tiny', 'SLaK_small', 'SLaK_base']
         if args.backbone in backbones:
             from model.unet import UNetResnet
             model = UNetResnet(num_classes=args.classes,
@@ -160,9 +161,6 @@ def main_worker(gpu, ngpus_per_node, argss):
                                 criterion=criterion)
             modules_ori=[model.initial, model.layer1, model.layer2, 
                         model.layer3, model.layer4]
-            #modules_new=[model.decoder1, model.upconv1, model.decoder2, 
-            #            model.upconv2, model.decoder3, model.upconv3, 
-            #            model.decoder4, model.upconv4, model.last]
             modules_new=[model.decoder1, model.decoder2, 
                         model.decoder3, model.decoder4, model.last]
         elif args.backbone in convnext_backbones:
@@ -171,6 +169,18 @@ def main_worker(gpu, ngpus_per_node, argss):
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
                                 criterion=criterion)
+            modules_ori=[model.initial, model.layer1, model.layer2, 
+                        model.layer3, model.layer4]
+            modules_new=[model.decoder1, model.decoder2, 
+                        model.decoder3, model.decoder4, model.last]
+        elif args.backbone in slak_backbones:
+            from model.unet import UNetSLaK
+            args.pretrained= True if args.width_factor==1.3 else False
+            model = UNetSLaK(num_classes=args.classes,
+                                in_channels=3, backbone=args.backbone,
+                                pretrained=args.pretrained,
+                                criterion=criterion, kernel_size=args.kernel_size,
+                                width_factor=args.width_factor, Decom= args.Decom)
             modules_ori=[model.initial, model.layer1, model.layer2, 
                         model.layer3, model.layer4]
             modules_new=[model.decoder1, model.decoder2, 
@@ -207,6 +217,9 @@ def main_worker(gpu, ngpus_per_node, argss):
     if hasattr(args, 'optimizer') and args.optimizer == 'adam':
         optimizer = torch.optim.Adam(params_list, lr=args.base_lr,                                     
                                     weight_decay=args.weight_decay)
+    elif hasattr(args, 'optimizer') and args.optimizer == 'adamw':
+        opt_args=dict(lr=args.base_lr, weight_decay=0.05, eps=1e-8)
+        optimizer = torch.optim.AdamW(params_list,**opt_args)
     else:
         optimizer = torch.optim.SGD(params_list, lr=args.base_lr, 
                                     momentum=args.momentum, 
@@ -228,7 +241,7 @@ def main_worker(gpu, ngpus_per_node, argss):
         args.batch_size_val = int(args.batch_size_val / ngpus_per_node)
         args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
         #model = torch.nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[gpu])
-        model = torch.nn.parallel.DistributedDataParallel(model.to(args.device))#, device_ids=[gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model.to(args.device), find_unused_parameters=True)#, device_ids=[gpu])
     else:
         #model = torch.nn.DataParallel(model.cuda())
         model = torch.nn.DataParallel(model.to(args.device))
