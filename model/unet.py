@@ -40,10 +40,50 @@ def backbone_conv(in_channels, out_channels, inner_channels=None):
         nn.ReLU(inplace=True))
     return down_conv
 
+def backbone_convnext(in_channels, out_channels, kernel_size=7, inner_channels=None, small_conv=None):
+    inner_channels = out_channels // 2 if inner_channels is None else inner_channels
+    down_conv = nn.Sequential(
+        nn.Conv2d(in_channels*2, inner_channels, kernel_size=kernel_size, 
+                padding=(kernel_size-1)//2, bias=False, 
+                groups=math.gcd(in_channels*2, inner_channels)) \
+                if small_conv==None else convolution(in_channels, out_channels, kernel_size, inner_channels, small_conv),
+        permutation_one(),
+        convnext.LayerNorm(inner_channels, eps=1e-6),
+        nn.Linear(inner_channels, inner_channels*4),
+        nn.GELU(),
+        nn.Linear(inner_channels*4, out_channels),
+        permutation_two()
+        )
+    return down_conv
+
 def convTrans2d(in_planes, out_planes, kernel_size=2, stride=2, padding=0):
     """convtranspose 2d"""
     return nn.ConvTranspose2d(in_planes, out_planes, kernel_size=kernel_size, 
                                 stride=stride, padding=padding, bias=False)
+
+class permutation_one(nn.Module):
+    def __init__(self):
+        super(permutation_one, self).__init__()
+    def forward(self, x):
+        return x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
+
+class permutation_two(nn.Module):
+    def __init__(self):
+        super(permutation_two, self).__init__()
+    def forward(self, x):
+        return x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
+
+class convolution(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, inner_channels, small_conv):
+        super(convolution, self).__init__()
+        self.large_convolution = nn.Conv2d(in_channels*2, inner_channels, kernel_size=kernel_size, 
+                                    padding=(kernel_size-1)//2, bias=False, 
+                                    groups=math.gcd(in_channels*2, inner_channels))        
+        self.small_convolution = nn.Conv2d(in_channels*2, inner_channels, kernel_size=small_conv, 
+                                    padding=(small_conv-1)//2, bias=False, 
+                                    groups=math.gcd(in_channels*2, inner_channels))
+    def forward(self, x):
+        return self.large_convolution(x) + self.small_convolution(x)        
 
 class encoder(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -82,17 +122,40 @@ class decoder(nn.Module):
         x = self.up_conv(x)
         return x
 
+
 class decoder_resnet(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, kernel_size=2, 
+                backbone_kernel=7, use_convnext_backbone=False, 
+                small_trans=None, small_conv=None):
         super(decoder_resnet, self).__init__()
-        pos1=int(in_channels*2)
-        pos2=int(in_channels)
-        self.up = nn.ConvTranspose2d(pos1, pos2, kernel_size=2, stride=2)
-        self.up_conv = backbone_conv(int(in_channels), out_channels)
+        pos1 = int(in_channels*2)
+        pos2 = int(in_channels)
+        padding = 0 
+        output_padding = 0 if kernel_size==2 else 1  
+        if kernel_size != 2:
+            padding = (kernel_size-1)//2
+
+        #groups=pos2 if (kernel_size>2 and pos1%pos2==0) else 1         
+        groups=math.gcd(pos1, pos2) if kernel_size>2 else 1 
+        self.up = nn.ConvTranspose2d(pos1, pos2, kernel_size=kernel_size, 
+                                    stride=2, padding=padding, groups=groups, 
+                                    output_padding=output_padding)
+        self.up_conv = backbone_convnext(int(in_channels), out_channels, 
+                                            kernel_size=backbone_kernel, small_conv=small_conv) \
+                        if use_convnext_backbone else backbone_conv(int(in_channels), out_channels)
+        self.small_trans_kernel = nn.ConvTranspose2d(pos1, pos2, kernel_size=small_trans, 
+                                    stride=2, padding=(small_trans-1)//2, groups=groups, 
+                                    output_padding=output_padding) if small_trans!=None else None
 
     def forward(self, x_copy, x, interpolate=True):       
         # Concatenate
-        x = self.up(x)
+        #x1 = self.up(x)
+        #x = (x1 + self.small_trans_kernel(x)) if self.small_trans_kernel != None else x
+        #x = self.up(x) + (self.small_trans_kernel(x) if self.small_trans_kernel != None else None)
+        if self.small_trans_kernel != None:
+            x = self.up(x) + self.small_trans_kernel(x)
+        else:
+            x = self.up(x)
         x = torch.cat([x_copy, x], dim=1)
         x = self.up_conv(x)        
         return x
@@ -168,7 +231,8 @@ class UNet(BaseModel):
 class UNetResnet(BaseModel):    
     def __init__(self, num_classes, in_channels=3, backbone='resnet50', 
                 pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255), 
-                freeze_bn=False, freeze_backbone=False, **_):
+                freeze_bn=False, trans_kernel=2, backbone_kernel=7, 
+                use_convnext_backbone=False, small_trans=None, small_conv=None, freeze_backbone=False, **_):
         super(UNetResnet, self).__init__()
         """
         #############    AWAITING UPGRADE     #############
@@ -211,9 +275,21 @@ class UNetResnet(BaseModel):
         #self.decoder1 = decoder(int(base_width), int(base_width/2))
         self.decoder1 = x2conv(int(base_width), int(base_width))
         #self.decoder1 = decoder(1024, 512)
-        self.decoder2 = decoder_resnet(int(base_width/2), int(base_width/2))
-        self.decoder3 = decoder_resnet(int(base_width/4), int(base_width/4))
-        self.decoder4 = decoder_resnet(int(base_width/8), int(base_width/8))
+        self.decoder2 = decoder_resnet(int(base_width/2), int(base_width/2), 
+                                        kernel_size=trans_kernel[0], small_trans=small_trans, 
+                                        backbone_kernel=backbone_kernel[0], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
+        self.decoder3 = decoder_resnet(int(base_width/4), int(base_width/4), 
+                                        kernel_size=trans_kernel[1], small_trans=small_trans, 
+                                        backbone_kernel=backbone_kernel[1], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
+        self.decoder4 = decoder_resnet(int(base_width/8), int(base_width/8), 
+                                        kernel_size=trans_kernel[2], small_trans=small_trans, 
+                                        backbone_kernel=backbone_kernel[2], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
         #self.decoder4 = decoder(int(base_width/16), int(base_width/32))
         self.last = nn.Sequential(OrderedDict([("up", nn.ConvTranspose2d(int(base_width/8), 
                                             int(base_width/32), 
@@ -353,7 +429,8 @@ class UNetResnet(BaseModel):
 class UNetConvNeXt(BaseModel):
     def __init__(self, num_classes, in_channels=3, backbone='convnext_tiny', 
                 pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
-                freeze_bn=False, freeze_backbone=False,**_):
+                freeze_bn=False, trans_kernel=2, backbone_kernel=7, 
+                use_convnext_backbone=False, small_trans=None, small_conv=None, freeze_backbone=False,**_):
         super(UNetConvNeXt, self).__init__()
         
         self.criterion = criterion
@@ -380,9 +457,21 @@ class UNetConvNeXt(BaseModel):
         """
         self.decoder1 = x2conv(int(base_width), int(base_width))
         #self.decoder1 = decoder(1024, 512)
-        self.decoder2 = decoder_resnet(int(base_width/2), int(base_width/2))
-        self.decoder3 = decoder_resnet(int(base_width/4), int(base_width/4))
-        self.decoder4 = decoder_resnet(int(base_width/8), int(base_width/8))
+        self.decoder2 = decoder_resnet(int(base_width/2), int(base_width/2), 
+                                        kernel_size=trans_kernel[0], small_trans=small_trans,
+                                        backbone_kernel=backbone_kernel[0], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
+        self.decoder3 = decoder_resnet(int(base_width/4), int(base_width/4), 
+                                        kernel_size=trans_kernel[1], small_trans=small_trans, 
+                                        backbone_kernel=backbone_kernel[1], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
+        self.decoder4 = decoder_resnet(int(base_width/8), int(base_width/8), 
+                                        kernel_size=trans_kernel[2], small_trans=small_trans, 
+                                        backbone_kernel=backbone_kernel[2], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
         #self.decoder4 = decoder(int(base_width/16), int(base_width/32))
         self.last = nn.Sequential(OrderedDict([
                                 ("conv", nn.Conv2d(int(base_width/4), 
@@ -476,7 +565,8 @@ class UNetSLaK(BaseModel):
     def __init__(self, num_classes, in_channels=3, backbone='SLaK_tiny', 
                 pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
                 drop_path_rate=0.0, kernel_size=[51,49,47,13,5], width_factor=1.3, Decom=True,
-                bn=True, freeze_bn=False, freeze_backbone=False,**_):
+                bn=True, trans_kernel=2, backbone_kernel=7, small_conv=None, 
+                use_convnext_backbone=False, small_trans=None, freeze_bn=False, freeze_backbone=False,**_):
         super(UNetSLaK, self).__init__()
         
         self.criterion = criterion
@@ -493,7 +583,7 @@ class UNetSLaK(BaseModel):
                 raise NotImplementedError('pretrained specified for an architecture that is not supported!')
             model.load_state_dict(checkpoint)
         base_width = model.head.in_features
-        self.base_width=base_width
+        self.base_width=base_width        
         
         self.initial = list(model.downsample_layers[0])  
         
@@ -509,9 +599,19 @@ class UNetSLaK(BaseModel):
 
         # decoder         
         self.decoder1 = x2conv(int(base_width), int(base_width))
-        self.decoder2 = decoder_resnet(base_width/2, int(base_width/2))
-        self.decoder3 = decoder_resnet(base_width/4, int(base_width/4))
-        self.decoder4 = decoder_resnet(base_width/8, int(base_width/8))
+        self.decoder2 = decoder_resnet(base_width/2, int(base_width/2), 
+                                        kernel_size=trans_kernel[0], small_trans=small_trans,
+                                        backbone_kernel=backbone_kernel[0], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
+        self.decoder3 = decoder_resnet(base_width/4, int(base_width/4), small_trans=small_trans,
+                                        kernel_size=trans_kernel[1], backbone_kernel=backbone_kernel[1], 
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
+        self.decoder4 = decoder_resnet(base_width/8, int(base_width/8), kernel_size=trans_kernel[2], 
+                                        backbone_kernel=backbone_kernel[2], small_trans=small_trans,
+                                        use_convnext_backbone=use_convnext_backbone,
+                                        small_conv=small_conv)
     
         self.last = nn.Sequential(OrderedDict([
                                 ("conv", nn.Conv2d(int(base_width/8)*2, 

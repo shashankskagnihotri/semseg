@@ -130,6 +130,12 @@ def main_worker(gpu, ngpus_per_node, argss):
         criterion = MSELoss(ignore_index=args.ignore_label)
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
+    args.trans_kernel = 2 if not hasattr(args, 'trans_kernel') else args.trans_kernel
+    args.backbone_kernel = 7 if not hasattr(args, 'backbone_kernel') else args.backbone_kernel
+    args.use_convnext_backbone = False if not hasattr(args, 'use_convnext_backbone') else args.use_convnext_backbone
+    args.small_trans = None if not hasattr(args, 'small_trans') else args.small_trans
+    args.small_conv = None if not hasattr(args, 'small_conv') else args.small_conv
+        
     if args.arch == 'psp':
         from model.pspnet import PSPNet
         model = PSPNet(layers=args.layers, classes=args.classes, 
@@ -158,7 +164,11 @@ def main_worker(gpu, ngpus_per_node, argss):
             model = UNetResnet(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
-                                criterion=criterion)
+                                criterion=criterion, trans_kernel=args.trans_kernel, 
+                                backbone_kernel=args.backbone_kernel, 
+                                use_convnext_backbone=args.use_convnext_backbone,
+                                small_trans=args.small_trans,
+                                small_conv=args.small_conv)
             modules_ori=[model.initial, model.layer1, model.layer2, 
                         model.layer3, model.layer4]
             modules_new=[model.decoder1, model.decoder2, 
@@ -168,7 +178,11 @@ def main_worker(gpu, ngpus_per_node, argss):
             model = UNetConvNeXt(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
-                                criterion=criterion)
+                                criterion=criterion, trans_kernel=args.trans_kernel, 
+                                backbone_kernel=args.backbone_kernel, 
+                                use_convnext_backbone=args.use_convnext_backbone,
+                                small_trans=args.small_trans,
+                                small_conv=args.small_conv)
             modules_ori=[model.initial, model.layer1, model.layer2, 
                         model.layer3, model.layer4]
             modules_new=[model.decoder1, model.decoder2, 
@@ -180,7 +194,12 @@ def main_worker(gpu, ngpus_per_node, argss):
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
                                 criterion=criterion, kernel_size=args.kernel_size,
-                                width_factor=args.width_factor, Decom= args.Decom)
+                                width_factor=args.width_factor, Decom= args.Decom, 
+                                trans_kernel=args.trans_kernel, 
+                                backbone_kernel=args.backbone_kernel, 
+                                use_convnext_backbone=args.use_convnext_backbone,
+                                small_trans=args.small_trans,
+                                small_conv=args.small_conv)
             modules_ori=[model.initial, model.layer1, model.layer2, 
                         model.layer3, model.layer4]
             modules_new=[model.decoder1, model.decoder2, 
