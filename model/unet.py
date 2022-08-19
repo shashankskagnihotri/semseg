@@ -231,7 +231,7 @@ class UNet(BaseModel):
 class UNetResnet(BaseModel):    
     def __init__(self, num_classes, in_channels=3, backbone='resnet50', 
                 pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255), 
-                freeze_bn=False, trans_kernel=2, backbone_kernel=7, 
+                freeze_bn=False, trans_kernel=[2, 2, 2], backbone_kernel=[7, 7, 7], 
                 use_convnext_backbone=False, small_trans=None, small_conv=None, freeze_backbone=False, **_):
         super(UNetResnet, self).__init__()
         """
@@ -429,7 +429,7 @@ class UNetResnet(BaseModel):
 class UNetConvNeXt(BaseModel):
     def __init__(self, num_classes, in_channels=3, backbone='convnext_tiny', 
                 pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
-                freeze_bn=False, trans_kernel=2, backbone_kernel=7, 
+                freeze_bn=False, trans_kernel=[2, 2, 2], backbone_kernel=[7, 7, 7], 
                 use_convnext_backbone=False, small_trans=None, small_conv=None, freeze_backbone=False,**_):
         super(UNetConvNeXt, self).__init__()
         
@@ -565,7 +565,7 @@ class UNetSLaK(BaseModel):
     def __init__(self, num_classes, in_channels=3, backbone='SLaK_tiny', 
                 pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
                 drop_path_rate=0.0, kernel_size=[51,49,47,13,5], width_factor=1.3, Decom=True,
-                bn=True, trans_kernel=2, backbone_kernel=7, small_conv=None, 
+                bn=True, trans_kernel=[2, 2, 2], backbone_kernel=[7, 7, 7], small_conv=None, 
                 use_convnext_backbone=False, small_trans=None, freeze_bn=False, freeze_backbone=False,**_):
         super(UNetSLaK, self).__init__()
         

@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import logging
 import argparse
+import math
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -130,8 +131,8 @@ def main_worker(gpu, ngpus_per_node, argss):
         criterion = MSELoss(ignore_index=args.ignore_label)
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
-    args.trans_kernel = 2 if not hasattr(args, 'trans_kernel') else args.trans_kernel
-    args.backbone_kernel = 7 if not hasattr(args, 'backbone_kernel') else args.backbone_kernel
+    args.trans_kernel = [2, 2, 2] if not hasattr(args, 'trans_kernel') else args.trans_kernel
+    args.backbone_kernel = [7, 7, 7] if not hasattr(args, 'backbone_kernel') else args.backbone_kernel
     args.use_convnext_backbone = False if not hasattr(args, 'use_convnext_backbone') else args.use_convnext_backbone
     args.small_trans = None if not hasattr(args, 'small_trans') else args.small_trans
     args.small_conv = None if not hasattr(args, 'small_conv') else args.small_conv
@@ -244,7 +245,7 @@ def main_worker(gpu, ngpus_per_node, argss):
                                     momentum=args.momentum, 
                                     weight_decay=args.weight_decay)
     if args.sync_bn:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)    
 
     if main_process():
         global logger, writer
@@ -342,11 +343,15 @@ def main_worker(gpu, ngpus_per_node, argss):
                             num_workers=args.workers, pin_memory=True, 
                             sampler=val_sampler)
 
+    if args.use_cosine_annealing:
+        max_iterations = math.floor(len(train_data)/args.batch_size)*args.epochs
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iterations, verbose=False)
+
     for epoch in range(args.start_epoch, args.epochs):
         epoch_log = epoch + 1
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch)
+        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch, scheduler)
         if main_process():
             writer.add_scalar('loss_train', loss_train, epoch_log)
             writer.add_scalar('mIoU_train', mIoU_train, epoch_log)
@@ -371,7 +376,7 @@ def main_worker(gpu, ngpus_per_node, argss):
                 writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
 
 
-def train(train_loader, model, optimizer, epoch):
+def train(train_loader, model, optimizer, epoch, scheduler):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     main_loss_meter = AverageMeter()
@@ -424,6 +429,7 @@ def train(train_loader, model, optimizer, epoch):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         n = input.size(0)
         if args.multiprocessing_distributed:
