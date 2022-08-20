@@ -27,8 +27,8 @@ cv2.setNumThreads(0)
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet50.yaml', help='config file')
-    parser.add_argument('opts', help='see config/voc2012/voc2012_unet50.yaml for all options', default=None, nargs=argparse.REMAINDER)
+    parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
+    parser.add_argument('opts', help='see config/voc2012/voc2012_unet_convnexttiny_250.yaml for all options', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.config is not None
     cfg = config.load_cfg_from_cfg_file(args.config)
@@ -131,11 +131,11 @@ def main_worker(gpu, ngpus_per_node, argss):
         criterion = MSELoss(ignore_index=args.ignore_label)
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
-    args.trans_kernel = [2, 2, 2] if not hasattr(args, 'trans_kernel') else args.trans_kernel
-    args.backbone_kernel = [7, 7, 7] if not hasattr(args, 'backbone_kernel') else args.backbone_kernel
+    args.trans_kernel = [2, 2, 2] if not hasattr(args, 'trans_kernel') else [int(args.trans_kernel), int(args.trans_kernel), int(args.trans_kernel)]
+    args.backbone_kernel = [7, 7, 7] if not hasattr(args, 'backbone_kernel') else [int(args.backbone_kernel), int(args.backbone_kernel), int(args.backbone_kernel)]
     args.use_convnext_backbone = False if not hasattr(args, 'use_convnext_backbone') else args.use_convnext_backbone
-    args.small_trans = None if not hasattr(args, 'small_trans') else args.small_trans
-    args.small_conv = None if not hasattr(args, 'small_conv') else args.small_conv
+    args.small_trans = 0 if not hasattr(args, 'small_trans') else int(args.small_trans)
+    args.small_conv = 0 if not hasattr(args, 'small_conv') else int(args.small_conv)
         
     if args.arch == 'psp':
         from model.pspnet import PSPNet

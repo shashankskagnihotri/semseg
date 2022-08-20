@@ -122,6 +122,7 @@ def _check_and_coerce_cfg_value_type(replacement, original, key, full_key):
     the right type. The type is correct if it matches exactly or is one of a few
     cases in which the type can be easily coerced.
     """
+    print("\n\n\n\nreplacement:", replacement)
     original_type = type(original)
     replacement_type = type(replacement)
 

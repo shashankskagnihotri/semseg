@@ -46,7 +46,7 @@ def backbone_convnext(in_channels, out_channels, kernel_size=7, inner_channels=N
         nn.Conv2d(in_channels*2, inner_channels, kernel_size=kernel_size, 
                 padding=(kernel_size-1)//2, bias=False, 
                 groups=math.gcd(in_channels*2, inner_channels)) \
-                if small_conv==None else convolution(in_channels, out_channels, kernel_size, inner_channels, small_conv),
+                if small_conv==0 else convolution(in_channels, out_channels, kernel_size, inner_channels, small_conv),
         permutation_one(),
         convnext.LayerNorm(inner_channels, eps=1e-6),
         nn.Linear(inner_channels, inner_channels*4),
@@ -145,7 +145,7 @@ class decoder_resnet(nn.Module):
                         if use_convnext_backbone else backbone_conv(int(in_channels), out_channels)
         self.small_trans_kernel = nn.ConvTranspose2d(pos1, pos2, kernel_size=small_trans, 
                                     stride=2, padding=(small_trans-1)//2, groups=groups, 
-                                    output_padding=output_padding) if small_trans!=None else None
+                                    output_padding=output_padding) if small_trans!=0 else None
 
     def forward(self, x_copy, x, interpolate=True):       
         # Concatenate
