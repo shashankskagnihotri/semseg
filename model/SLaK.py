@@ -7,7 +7,7 @@
 
 import sys
 # Add WHERE_YOU_CLONED_CUTLASS/examples/19_large_depthwise_conv2d_torch_extension into your PYTHONPATH by the following commands:
-sys.path.append('/work/ws-tmp/sa058646-segment/SLaK/cutlass/examples/19_large_depthwise_conv2d_torch_extension')
+sys.path.append('/work/ws-tmp/sa058646-segment2/SLaK/cutlass/examples/19_large_depthwise_conv2d_torch_extension')
 
 import torch
 import torch.nn as nn

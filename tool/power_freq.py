@@ -19,13 +19,9 @@ import os
 import math
 import matplotlib
 import scipy.signal as signal
-import scipy.stats as stats
-from pathlib import Path
 
 cv2.ocl.setUseOpenCL(False)
 maps = 0
-outputs = []
-image_names = []
 output_before_softmax = 0
 
 def get_parser():
@@ -41,9 +37,7 @@ def get_parser():
     return cfg
 
 
-def get_logger(save_folder):
-    log_path = str(save_folder) + '/log.log'
-    logging.basicConfig(filename=log_path, filemode='a')
+def get_logger():
     logger_name = "main-logger"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
@@ -84,8 +78,7 @@ def main():
     global args, logger, maps, output_before_softmax
     args = get_parser()
     check(args)
-    check_makedirs(args.save_folder)
-    logger = get_logger(args.save_folder)
+    logger = get_logger()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.test_gpu)
     logger.info(args)
     logger.info("=> creating model ...")
@@ -99,31 +92,17 @@ def main():
 
     gray_folder = os.path.join(args.save_folder, 'gray')
     color_folder = os.path.join(args.save_folder, 'color')
-    freq_folder = os.path.join(args.save_folder, 'frequency')    
-    feature_folder = os.path.join(args.save_folder, 'feature_maps')
-    check_makedirs(gray_folder)
-    check_makedirs(color_folder)
-    check_makedirs(freq_folder)
-    check_makedirs(feature_folder)
-    
+    freq_folder = os.path.join(args.save_folder, 'frequency')
 
     test_transform = transform.Compose([transform.ToTensor()])
     test_data = dataset.SemData(split=args.split, data_root=args.data_root, data_list=args.test_list, transform=test_transform)
     index_start = args.index_start
-    #end = 500 if args.testing else len(test_data.data_list)
-    end = len(test_data.data_list)
+    end = 20 if args.testing else len(test_data.data_list)
     if args.index_step == 0:
         index_end = end
-        #index_end = 10
     else:
         index_end = min(index_start + args.index_step, end)
-    if args.testing:
-        test_data.data_list = test_data.data_list[index_start:index_end:2]
-    else:
-        test_data.data_list = test_data.data_list[index_start:index_end]
-    #if args.testing:
-    #    test_loader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True, sampler = torch.utils.data.RandomSampler(test_data, replacement=True, num_samples=500))
-    #else:
+    test_data.data_list = test_data.data_list[index_start:index_end]
     test_loader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
     colors = np.loadtxt(args.colors_path).astype('uint8')
     names = [line.rstrip('\n') for line in open(args.names_path)]
@@ -133,23 +112,11 @@ def main():
     args.use_convnext_backbone = False if not hasattr(args, 'use_convnext_backbone') else args.use_convnext_backbone
     args.small_trans = 0 if not hasattr(args, 'small_trans') else int(args.small_trans)
     args.small_conv = 0 if not hasattr(args, 'small_conv') else int(args.small_conv)
-    args.psp_kernel = 0 if not hasattr(args, 'psp_kernel') else int(args.psp_kernel)
-    args.freq_upscale = False if not hasattr(args, 'freq_upscale') else args.freq_upscale
     
     if not args.has_prediction:
         if args.arch == 'psp':
-            if "convnext" in args.backbone:
-                from model.pspnet_convnext import PSPNet
-                model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, pretrained=False)
-            elif "resnet" in args.backbone:
-                if args.psp_kernel>0:
-                    from model.pspnet_kernels import PSPNet
-                    model = PSPNet(layers=args.layers, classes=args.classes, 
-                            zoom_factor=args.zoom_factor, psp_kernel=args.psp_kernel)            
-                else:
-                    from model.pspnet import PSPNet
-                    model = PSPNet(layers=args.layers, classes=args.classes, 
-                            zoom_factor=args.zoom_factor)            
+            from model.pspnet_convnext import PSPNet
+            model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, pretrained=False)
         elif args.arch == 'psa':
             from model.psanet import PSANet
             model = PSANet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, compact=args.compact,
@@ -161,10 +128,7 @@ def main():
                                 'convnext_large', 'convnext_xlarge']
             slak_backbones = ['SLaK_tiny', 'SLaK_small', 'SLaK_base']
             if args.backbone in backbones:
-                if args.freq_upscale:
-                    from model.unet_freq_up import UNetResnet
-                else:
-                    from model.unet import UNetResnet
+                from model.unet import UNetResnet
                 model = UNetResnet(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained, 
@@ -174,10 +138,7 @@ def main():
                                 small_trans=args.small_trans,
                                 small_conv=args.small_conv)
             elif args.backbone in convnext_backbones:
-                if args.freq_upscale:
-                    from model.unet_freq_up import UNetConvNeXt
-                else:
-                    from model.unet import UNetConvNeXt
+                from model.unet import UNetConvNeXt
                 model = UNetConvNeXt(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
@@ -187,10 +148,7 @@ def main():
                                 small_trans=args.small_trans,
                                 small_conv=args.small_conv)
             elif args.backbone in slak_backbones:
-                if args.freq_upscale:
-                    from model.unet_freq_up import UNetSLaK
-                else:
-                    from model.unet import UNetSLaK
+                from model.unet import UNetSLaK
                 model = UNetSLaK(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
@@ -220,94 +178,14 @@ def main():
             logger.info("=> loaded checkpoint '{}'".format(args.model_path))
         else:
             raise RuntimeError("=> no checkpoint found at '{}'".format(args.model_path))
-        test(test_loader, test_data.data_list, model, args.classes, mean, std, args.base_size, args.test_h, args.test_w, args.scales, gray_folder, color_folder, freq_folder, colors, feature_folder=feature_folder)
+        test(test_loader, test_data.data_list, model, args.classes, mean, std, args.base_size, args.test_h, args.test_w, args.scales, gray_folder, color_folder, freq_folder, colors)
     if args.split != 'test':
         cal_acc(test_data.data_list, gray_folder, args.classes, names)
 
-def plot_features(maps, image_name=None, feature_folder=None):
-    horizontal = 0
-    verticle = 0
-    first_h = True
-    first_v = True
-    index = 0
-    #import ipdb;ipdb.set_trace()
-    #for _ in range(12):
-    #    for _ in range(8):
-    #        ax = plt.subplot(12, 8, ix)
-    #        ax.set_xticks([])
-    #        ax.set_yticks([])
-    #        plt.imshow(map[ix-1,:,:])
-    #        ix += 1
-    #maps_name = feature_folder + '/' + image_name+'_output_map.png'
-    maps_name = feature_folder + '/' + image_name+'_binary_map.png'
-    #plt.savefig(maps_name, dpi=500)
-    #for index in range(512):
-    for index in range(96):
-        feat = np.uint8(maps[index])
-        #import ipdb;ipdb.set_trace()
-        feat = (feat - feat.min()) * (1/(feat.max() - feat.min()))*255
-        
-        feat[feat<125]=0
-        feat[feat>125]=255
-        #import ipdb;ipdb.set_trace()
-        if first_h:
-            horizontal = feat
-            first_h = False
-        else:
-            horizontal=np.hstack((horizontal, feat))
-        #if (index+1)%32==0:
-        if (index+1)%12==0:
-            first_h=True
-            if first_v:
-                verticle = horizontal                
-                first_v=False
-            else:
-                verticle = np.vstack((verticle, horizontal))
-    #import ipdb;ipdb.set_trace()
-    cv2.imwrite(maps_name, verticle)
 
-def plot_posterior(maps, image_name=None, feature_folder=None):
-    horizontal = 0
-    verticle = 0
-    first_h = True
-    first_v = True
-    index = 0
-    #import ipdb;ipdb.set_trace()
-    #for _ in range(12):
-    #    for _ in range(8):
-    #        ax = plt.subplot(12, 8, ix)
-    #        ax.set_xticks([])
-    #        ax.set_yticks([])
-    #        plt.imshow(map[ix-1,:,:])
-    #        ix += 1
-    maps_name = feature_folder + '/' + image_name+'_output_map.png'
-    
-    #plt.savefig(maps_name, dpi=500)
-    for index in range(21):
-        feat = np.uint8(maps[index])
-        #import ipdb;ipdb.set_trace()
-        if first_h:
-            horizontal = feat
-            first_h = False
-        else:
-            horizontal=np.hstack((horizontal, feat))
-        if (index+1)%7==0:
-            first_h=True
-            if first_v:
-                verticle = horizontal                
-                first_v=False
-            else:
-                verticle = np.vstack((verticle, horizontal))
-    #import ipdb;ipdb.set_trace()
-    cv2.imwrite(maps_name, verticle)
-    
-
-    
-
-
-def net_process(model, image, mean, std=None, flip=False, image_name=None, feature_folder=None):    
+def net_process(model, image, mean, std=None, flip=False):    
     input = torch.from_numpy(image.transpose((2, 0, 1))).float()
-    global maps, output_before_softmax, args, outputs
+    global maps, output_before_softmax
     if std is None:
         for t, m in zip(input, mean):
             t.sub_(m)
@@ -318,26 +196,13 @@ def net_process(model, image, mean, std=None, flip=False, image_name=None, featu
     if flip:
         input = torch.cat([input, input.flip(3)], 0)
     with torch.no_grad():
-        if args.arch=='unet':
-            maps = model(input)   
-            #import ipdb;ipdb.set_trace()         
-            output = model.module.last.out(maps)            
-            maps = maps.detach().cpu()#.numpy()
-        else:
-            output, maps = model(input)
-    #plot_posterior(output[0].detach().cpu(), image_name, feature_folder)
+        output = model(input)
     _, _, h_i, w_i = input.shape
     _, _, h_o, w_o = output.shape
     if (h_o != h_i) or (w_o != w_i):
         output = F.interpolate(output, (h_i, w_i), mode='bilinear', align_corners=True)
-
-    maps = maps[0].detach().cpu().numpy()
-    #import ipdb;ipdb.set_trace()
-
-
-    plot_features(maps, image_name, feature_folder)
-    #maps = model.module.feature_map
-    #output_before_softmax = torch.clone(output)[0]
+    maps = torch.clone(model.module.feature_map)[0]
+    output_before_softmax = torch.clone(output)[0]
     output = F.softmax(output, dim=1)
     if flip:
         output = (output[0] + output[1].flip(2)) / 2
@@ -345,13 +210,10 @@ def net_process(model, image, mean, std=None, flip=False, image_name=None, featu
         output = output[0]
     output = output.data.cpu().numpy()
     output = output.transpose(1, 2, 0)
-    input.detach().cpu()
-    del input
-    torch.cuda.empty_cache()
     return output
 
 
-def scale_process(model, image, classes, crop_h, crop_w, h, w, mean, std=None, stride_rate=2/3, image_name=None, feature_folder=None):
+def scale_process(model, image, classes, crop_h, crop_w, h, w, mean, std=None, stride_rate=2/3):
     ori_h, ori_w, _ = image.shape
     pad_h = max(crop_h - ori_h, 0)
     pad_w = max(crop_w - ori_w, 0)
@@ -376,7 +238,7 @@ def scale_process(model, image, classes, crop_h, crop_w, h, w, mean, std=None, s
             s_w = e_w - crop_w
             image_crop = image[s_h:e_h, s_w:e_w].copy()
             count_crop[s_h:e_h, s_w:e_w] += 1
-            prediction_crop[s_h:e_h, s_w:e_w, :] += net_process(model, image_crop, mean, std, image_name=image_name, feature_folder=feature_folder)
+            prediction_crop[s_h:e_h, s_w:e_w, :] += net_process(model, image_crop, mean, std)
     prediction_crop /= np.expand_dims(count_crop, 2)
     prediction_crop = prediction_crop[pad_h_half:pad_h_half+ori_h, pad_w_half:pad_w_half+ori_w]
     prediction = cv2.resize(prediction_crop, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -386,70 +248,74 @@ def find_nearest_idx(array, value):
     array = np.asarray(array)
     return (np.abs(array - value)).argmin()
 
-def power_spectra(data, freq_path):    
-    global args
-    #d2 = torch.device('cuda:1')
+def power_spectra(data, freq_path):
     #import ipdb;ipdb.set_trace()
-    d2 = torch.device('cuda:1')
-    first = True
-    first_amp = True
-    count = 0
-    amplitudes = []
-    for split_data in torch.split(torch.stack(data), 1):
-        for img in split_data[0]:            
-            if args.binarize:
-                img = img.cpu().numpy()
-                img = np.uint8(img)
-                img[img<128] = 0
-                img[img>128] = 1
-                img = torch.tensor(img)
-            if first:
-                freq_domain = np.expand_dims(torch.fft.fftn(img.to(d2)).detach().cpu().numpy(), axis=0)
-                first = False      
-            else:
-                freq_domain = np.vstack((freq_domain, np.expand_dims(torch.fft.fftn(img.to(d2)).detach().cpu().numpy(), axis=0)))
-        if first_amp:
-            amplitudes = np.expand_dims(np.average(np.abs(freq_domain)**2, axis=0), axis =0)
-            first_amp = False
-        else:
-            amplitudes = np.vstack((amplitudes, np.expand_dims(np.average(np.abs(freq_domain)**2, axis=0), axis =0)))
-        first=True
-    
-    amplitude = np.average(np.asarray(amplitudes), axis=0)
-   
-    npix = amplitude.shape[0]
-    kfreq = np.fft.fftfreq(npix) *npix
-
-    kfreq2D = np.meshgrid(kfreq, kfreq)
-    knrm = np.sqrt(kfreq2D[0]**2 + kfreq2D[1]**2)
-    knrm = knrm.flatten()
-    fourier_amplitudes = amplitude.flatten()
-
-    kbins = np.arange(0.5, npix//2+1, 1.)
-    kvals = 0.5 * (kbins[1:] + kbins[:-1])
-    Abins, _, _ = stats.binned_statistic(knrm, fourier_amplitudes,
-                                         statistic = "mean",
-                                         bins = kbins)
-    Abins *= np.pi * (kbins[1:]**2 - kbins[:-1]**2)
-
-    save_name = Path(freq_path).parent.parent.parent.name + '.pt'
-    file_name = os.path.join(freq_path, save_name)
-    
-    torch.save(torch.tensor([kvals, Abins], device='cpu'), file_name)
-    """
-    plt.loglog(kvals, Abins)
-    plt.xlabel("$k$")
-    plt.ylabel("$P(k)$")
+    data = np.average(data, axis = 0)  
+    freqs, psd = signal.welch(data.flatten())
+    plt.semilogx(freqs, psd)
+    plt.title('PSD: power spectral density')
+    plt.xlabel('Frequency')
+    plt.ylabel('Power')
     plt.tight_layout()
-    plt.savefig("cloud_power_spectrum2.png", dpi = 300, bbox_inches = "tight")
+    plt.savefig(freq_path)
+
+    """
+
+    freq_domain = np.fft.fftn(data)
+    n = data[0].size
+    freq = np.fft.fftfreq(n)
+    power = np.sqrt(freq_domain.real*freq_domain.real + freq_domain.imag*freq_domain.imag)
+    power = np.mean(power, axis=0)
+    freq = freq.flatten()
+    power = power.flatten()
+    plt.plot(freq, power)
+    plt.xlabel('freq')
+    plt.ylabel('power')
+    plt.savefig(freq_path)
+    plt.clf()
+
+    
+    fs = 1
+    dx = 1 
+    dy = 1
+    y_max = dy * data.shape[0] 
+    x_max = dx * data.shape[1] 
+    t_max = data.shape[2] / fs 
+    y = np.linspace(0, y_max, data.shape[0])  
+    x = np.linspace(0, x_max, data.shape[1])  
+
+    yy, xx = np.meshgrid(y, x, indexing='ij')
+
+    time_stamp = 1 
+    plt.figure()
+    plt.pcolormesh(xx, yy, data[:,:,time_stamp])
+    plt.xlabel('x, step')
+    plt.ylabel('y, step')
+    spectrum_3d = np.fft.fftn(data)    # Fourier transform alon Y, X and T axes to obtain ky, kx, f
+    spectrum_3d_sh = np.fft.fftshift(spectrum_3d, axes=(0,1))  # Apply frequency shift along spatial dimentions so
+                                                           # that zero-frequency component appears at the center of the spectrum
+    ky = np.linspace(-np.pi / y_max, np.pi / y_max, data.shape[0])  # wavenumber along Y axis (rad/step)
+    kx = np.linspace(-np.pi / x_max, np.pi / x_max, data.shape[1])  # wavenumber along X axis (rad/step)
+    f  = np.linspace(0, fs, data.shape[2])                          # frequency (Hz)
+    Ky, Kx = np.meshgrid(ky, kx, indexing='ij')
+    freq_to_observe = 1    # Hz
+    f_idx = find_nearest_idx(f, freq_to_observe)
+    plt.figure()
+    psd = plt.pcolormesh(Kx, Ky, abs(spectrum_3d_sh[:,:,f_idx])**2)
+    cbar = plt.colorbar(psd, label='PSD')
+    plt.xlabel('kx, rad/step')
+    plt.ylabel('ky, rad/step')
+    plt.savefig(freq_path)
+    plt.clf()
     """
 
 
-def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, crop_w, scales, gray_folder, color_folder, freq_folder, colors, feature_folder=None):
+
+
+def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, crop_w, scales, gray_folder, color_folder, freq_folder, colors):
     logger.info('>>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>')
-    global maps, output_before_softmax, args
-    all_maps = []    
-    
+    global maps, output_before_softmax
+    all_maps = []
     data_time = AverageMeter()
     batch_time = AverageMeter()
     model.eval()
@@ -460,8 +326,6 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
         image = np.transpose(input, (1, 2, 0))
         h, w, _ = image.shape
         prediction = np.zeros((h, w, classes), dtype=float)
-        image_path, _ = data_list[i]
-        image_name = image_path.split('/')[-1].split('.')[0]
         for scale in scales:
             long_size = round(scale * base_size)
             new_h = long_size
@@ -471,7 +335,7 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
             else:
                 new_h = round(long_size/float(w)*h)
             image_scale = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            prediction += scale_process(model, image_scale, classes, crop_h, crop_w, h, w, mean, std, image_name=image_name, feature_folder=feature_folder)
+            prediction += scale_process(model, image_scale, classes, crop_h, crop_w, h, w, mean, std)
         prediction /= len(scales)
         posterior = prediction
         prediction = np.argmax(prediction, axis=2)
@@ -487,22 +351,76 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
         check_makedirs(color_folder)
         check_makedirs(freq_folder)
         gray = np.uint8(prediction)
+        all_maps.append(maps.detach().cpu().numpy())#.transpose(1,2,0))
         
         
+        #import ipdb; ipdb.set_trace()
+        #f, a = power_spectra(model.module.feature_map.detach().cpu().numpy())
+        
+        #plt.plot(f[1:],a[1:], label = 'sum of amplitudes over y vs f_x')
+        #plt.ylabel( 'amplitude' )
+        #plt.xlabel( 'frequency' )
+        #plt.legend()
+        
+        """
+        gray_posterior= np.uint8(posterior)
+        f = np.fft.fft2(gray)
+        fshift = np.fft.fftshift(f)
+        magnitude_specturm = np.abs(fshift)
+        row, col = gray.shape
+        win_row, win_col = row//2, col//2        
+        fshift[win_row-30:win_row+30, win_col-30:win_col+30] = 0
+        f_ishift = np.fft.ifftshift(fshift)
+        img_back = np.fft.ifft2(f_ishift)
+        img_back = np.abs(img_back)
+        """
         color = colorize(gray, colors)
-        #image_path, _ = data_list[i]
-        #image_name = image_path.split('/')[-1].split('.')[0]
+        image_path, _ = data_list[i]
+        image_name = image_path.split('/')[-1].split('.')[0]
         gray_path = os.path.join(gray_folder, image_name + '.png')
         color_path = os.path.join(color_folder, image_name + '.png')
-
+        #plt.savefig( freq_path , transparent=False )
         cv2.imwrite(gray_path, gray)
-
-        
+        #import ipdb;ipdb.set_trace()
+        """
+        mag_path = os.path.join(freq_folder, image_name + '_mag.png')
+        freq_path = os.path.join(freq_folder, image_name + '_freq.png')
+        post_path = os.path.join(freq_folder, image_name + '_map.png')
+        new_col, new_row, rows, cols=True, True, 0,0
+        for it in range(posterior.shape[-1]):
+            maps=posterior[:,:,it]
+            if new_col:
+                cols=maps
+                new_col=False
+            else:                
+                cols=np.concatenate((cols,maps), axis=1)
+            if (it+1)%7==0:
+                cols.shape
+                if new_row:
+                    rows=cols
+                    new_row=False
+                else:
+                    rows=np.vstack([rows, cols])
+                new_col=True
+        #import ipdb;ipdb.set_trace()
+        #for i,j in zip(range(rows.shape[0]), range(rows.shape[1])):            
+        #    if rows[i,j] < 1e-7:
+        #        rows[i,j] = 255
+            #    item=0
+        #import ipdb;ipdb.set_trace()        
+        (thresh, blackAndWhiteImage) = cv2.threshold(rows, 0.1, 255, cv2.THRESH_BINARY)        
+        cv2.imwrite(post_path, blackAndWhiteImage)
+        cv2.imwrite(mag_path, magnitude_specturm)
+        cv2.imwrite(freq_path, img_back)
+        """
         color.save(color_path)
-        all_maps.append(torch.tensor(maps))#.transpose(1,2,0))
-    if args.testing:
-        power_spectra(all_maps, freq_folder)
-    
+    all_maps=np.asarray(all_maps)
+    #data = np.average(all_maps, axis=0)
+    #data = maps.detach().cpu().numpy()#.transpose(1,2,0)
+    freq_path = os.path.join(freq_folder, 'pow_spec.png')
+    #import ipdb;ipdb.set_trace()
+    data= all_maps
+    power_spectra(data, freq_path)
 
     logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
 
@@ -511,11 +429,9 @@ def cal_acc(data_list, pred_folder, classes, names):
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
-    global image_names
 
     for i, (image_path, target_path) in enumerate(data_list):
         image_name = image_path.split('/')[-1].split('.')[0]
-        image_names.append(image_name)
         pred = cv2.imread(os.path.join(pred_folder, image_name+'.png'), cv2.IMREAD_GRAYSCALE)
         target = cv2.imread(target_path, cv2.IMREAD_GRAYSCALE)
         intersection, union, target = intersectionAndUnion(pred, target, classes)

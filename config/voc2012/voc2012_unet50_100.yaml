@@ -5,18 +5,13 @@ DATA:
   classes: 21
 
 TRAIN:
-  arch: psp
-  layers: 50
+  arch: unet
   backbone: resnet50
-  sync_bn: True  # adopt sync_bn or not
-  optimizer: sgd
-  #optimizer: adamw
   pretrained: True
-  train_h: 473
-  train_w: 473
-  criterion: cross_entropy
-  use_cosine_annealing: False
-  #use_cosine_annealing: True
+  layers: 50
+  sync_bn: True  # adopt sync_bn or not
+  train_h: 256
+  train_w: 256
   scale_min: 0.5  # minimum random scale
   scale_max: 2.0  # maximum random scale
   rotate_min: -10  # minimum random rotate
@@ -24,59 +19,44 @@ TRAIN:
   zoom_factor: 8  # zoom factor for final prediction during training, be in [1, 2, 4, 8]
   ignore_label: 255
   aux_weight: 0.4
-  train_gpu: [0, 1, 2, 3] #, 2, 3] #, 4, 5, 6, 7]
+  train_gpu: [0]
+  #train_gpu: [0, 1]
+  #train_gpu: [0, 1, 2, 3] 
   workers: 64  # data loader workers
   batch_size: 16  # batch size for training
   batch_size_val: 8  # batch size for validation during training, memory and speed tradeoff
   base_lr: 0.01
-  #base_lr: 0.0001
-  epochs: 50
+  epochs: 101
   start_epoch: 0
   power: 0.9
   momentum: 0.9
   weight_decay: 0.0001
-  #weight_decay: 0.05
   manual_seed:
-  print_freq: 10
+  print_freq: 100
   save_freq: 1
-  #save_path: exp/voc2012/convnext_tiny/model
-  save_path: runs/pspnet/voc2012/resnet/vanila_4/model
+  save_path: exp/voc2012/unet101_resnet_pretrained_lr_0.01/model
   weight:  # path to initial weight (default: none)
-  resume:  # path to latest checkpoint (default: none)
-  evaluate: False  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
+  resume:  #exp/voc2012/unet500_pretrained/model/train_epoch_500.pth
+  evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
 Distributed:
   dist_url: tcp://127.0.0.1:6789
   dist_backend: 'nccl'
-  multiprocessing_distributed: False #True #False #
+  multiprocessing_distributed: True
   world_size: 1
   rank: 0
-
-   #LARGE KERNEL
-  Decom: True
-  width_factor: 1.3
-  kernel_size: [51, 49, 47, 13, 5]
-  trans_kernel: 2
-  backbone_kernel: 7
-  small_trans: 0 #3
-  small_conv: 0 #3
-  use_convnext_backbone: True
-
 
 TEST:
   test_list: dataset/voc2012/list/val.txt
   split: val  # split in [train, val and test]
   base_size: 512  # based size for scaling
-  test_h: 473
-  test_w: 473
+  test_h: 256
+  test_w: 256
   scales: [1.0]  # evaluation scales, ms as [0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
   has_prediction: False  # has prediction already or not
   index_start: 0  # evaluation start index in list
   index_step: 0  # evaluation step index in list, 0 means to end
   test_gpu: [0]
-  testing: False
-  epsilon: 0.0
-  #model_path: exp/voc2012/convnext_tiny/model/train_epoch_100.pth  # evaluation model path
-  model_path: /work/ws-tmp/sa058646-segment/semseg/runs/pspnet/voc2012/resnet/vanila_4/model/train_epoch_100.pth  # evaluation model path
-  save_folder: /work/ws-tmp/sa058646-segment/semseg/runs/pspnet/voc2012/resnet/vanila_4/val/ss  # results save folder
+  model_path: exp/voc2012/unet1000_pretrained/model/train_epoch_500.pth  # evaluation model path
+  save_folder: exp/voc2012/unet1000_pretrained/epoch_601/val/ss  # results save folder
   colors_path: data/voc2012/voc2012_colors.txt  # path of dataset colors
   names_path: data/voc2012/voc2012_names.txt  # path of dataset category names

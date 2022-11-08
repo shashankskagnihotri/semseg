@@ -30,7 +30,7 @@ TRAIN:
   batch_size_val: 8  # batch size for validation during training, memory and speed tradeoff
   base_lr: 0.01
   #base_lr: 0.0001
-  epochs: 50
+  epochs: 150
   start_epoch: 0
   power: 0.9
   momentum: 0.9
@@ -40,10 +40,10 @@ TRAIN:
   print_freq: 10
   save_freq: 1
   #save_path: exp/voc2012/convnext_tiny/model
-  save_path: runs/pspnet/voc2012/resnet/vanila_4/model
+  save_path: runs/pspnet/voc2012/resnet/kernel_11/model
   weight:  # path to initial weight (default: none)
   resume:  # path to latest checkpoint (default: none)
-  evaluate: False  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
+  evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
 Distributed:
   dist_url: tcp://127.0.0.1:6789
   dist_backend: 'nccl'
@@ -75,8 +75,10 @@ TEST:
   test_gpu: [0]
   testing: False
   epsilon: 0.0
+  binarize: True
+  psp_kernel: 11
   #model_path: exp/voc2012/convnext_tiny/model/train_epoch_100.pth  # evaluation model path
-  model_path: /work/ws-tmp/sa058646-segment/semseg/runs/pspnet/voc2012/resnet/vanila_4/model/train_epoch_100.pth  # evaluation model path
-  save_folder: /work/ws-tmp/sa058646-segment/semseg/runs/pspnet/voc2012/resnet/vanila_4/val/ss  # results save folder
+  model_path: /work/ws-tmp/sa058646-segment/Assignment/semseg/runs/pspnet/voc2012/resnet/vanila_4/model/train_epoch_50.pth  # evaluation model path
+  save_folder: /work/ws-tmp/sa058646-segment/semseg/runs/pspnet/voc2012/resnet/testing_725/val/ss  # results save folder
   colors_path: data/voc2012/voc2012_colors.txt  # path of dataset colors
   names_path: data/voc2012/voc2012_names.txt  # path of dataset category names

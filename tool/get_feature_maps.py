@@ -41,9 +41,7 @@ def get_parser():
     return cfg
 
 
-def get_logger(save_folder):
-    log_path = str(save_folder) + '/log.log'
-    logging.basicConfig(filename=log_path, filemode='a')
+def get_logger():
     logger_name = "main-logger"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
@@ -84,8 +82,7 @@ def main():
     global args, logger, maps, output_before_softmax
     args = get_parser()
     check(args)
-    check_makedirs(args.save_folder)
-    logger = get_logger(args.save_folder)
+    logger = get_logger()
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.test_gpu)
     logger.info(args)
     logger.info("=> creating model ...")
@@ -101,11 +98,7 @@ def main():
     color_folder = os.path.join(args.save_folder, 'color')
     freq_folder = os.path.join(args.save_folder, 'frequency')    
     feature_folder = os.path.join(args.save_folder, 'feature_maps')
-    check_makedirs(gray_folder)
-    check_makedirs(color_folder)
-    check_makedirs(freq_folder)
     check_makedirs(feature_folder)
-    
 
     test_transform = transform.Compose([transform.ToTensor()])
     test_data = dataset.SemData(split=args.split, data_root=args.data_root, data_list=args.test_list, transform=test_transform)
@@ -133,23 +126,11 @@ def main():
     args.use_convnext_backbone = False if not hasattr(args, 'use_convnext_backbone') else args.use_convnext_backbone
     args.small_trans = 0 if not hasattr(args, 'small_trans') else int(args.small_trans)
     args.small_conv = 0 if not hasattr(args, 'small_conv') else int(args.small_conv)
-    args.psp_kernel = 0 if not hasattr(args, 'psp_kernel') else int(args.psp_kernel)
-    args.freq_upscale = False if not hasattr(args, 'freq_upscale') else args.freq_upscale
     
     if not args.has_prediction:
         if args.arch == 'psp':
-            if "convnext" in args.backbone:
-                from model.pspnet_convnext import PSPNet
-                model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, pretrained=False)
-            elif "resnet" in args.backbone:
-                if args.psp_kernel>0:
-                    from model.pspnet_kernels import PSPNet
-                    model = PSPNet(layers=args.layers, classes=args.classes, 
-                            zoom_factor=args.zoom_factor, psp_kernel=args.psp_kernel)            
-                else:
-                    from model.pspnet import PSPNet
-                    model = PSPNet(layers=args.layers, classes=args.classes, 
-                            zoom_factor=args.zoom_factor)            
+            from model.pspnet_convnext import PSPNet
+            model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, pretrained=False)
         elif args.arch == 'psa':
             from model.psanet import PSANet
             model = PSANet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, compact=args.compact,
@@ -161,10 +142,7 @@ def main():
                                 'convnext_large', 'convnext_xlarge']
             slak_backbones = ['SLaK_tiny', 'SLaK_small', 'SLaK_base']
             if args.backbone in backbones:
-                if args.freq_upscale:
-                    from model.unet_freq_up import UNetResnet
-                else:
-                    from model.unet import UNetResnet
+                from model.unet import UNetResnet
                 model = UNetResnet(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained, 
@@ -174,10 +152,7 @@ def main():
                                 small_trans=args.small_trans,
                                 small_conv=args.small_conv)
             elif args.backbone in convnext_backbones:
-                if args.freq_upscale:
-                    from model.unet_freq_up import UNetConvNeXt
-                else:
-                    from model.unet import UNetConvNeXt
+                from model.unet import UNetConvNeXt
                 model = UNetConvNeXt(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
@@ -187,10 +162,7 @@ def main():
                                 small_trans=args.small_trans,
                                 small_conv=args.small_conv)
             elif args.backbone in slak_backbones:
-                if args.freq_upscale:
-                    from model.unet_freq_up import UNetSLaK
-                else:
-                    from model.unet import UNetSLaK
+                from model.unet import UNetSLaK
                 model = UNetSLaK(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
@@ -241,21 +213,16 @@ def plot_features(maps, image_name=None, feature_folder=None):
     #maps_name = feature_folder + '/' + image_name+'_output_map.png'
     maps_name = feature_folder + '/' + image_name+'_binary_map.png'
     #plt.savefig(maps_name, dpi=500)
-    #for index in range(512):
     for index in range(96):
         feat = np.uint8(maps[index])
-        #import ipdb;ipdb.set_trace()
-        feat = (feat - feat.min()) * (1/(feat.max() - feat.min()))*255
-        
         feat[feat<125]=0
-        feat[feat>125]=255
+        feat[feat>125]=1
         #import ipdb;ipdb.set_trace()
         if first_h:
             horizontal = feat
             first_h = False
         else:
             horizontal=np.hstack((horizontal, feat))
-        #if (index+1)%32==0:
         if (index+1)%12==0:
             first_h=True
             if first_v:
@@ -298,7 +265,7 @@ def plot_posterior(maps, image_name=None, feature_folder=None):
                 first_v=False
             else:
                 verticle = np.vstack((verticle, horizontal))
-    #import ipdb;ipdb.set_trace()
+    import ipdb;ipdb.set_trace()
     cv2.imwrite(maps_name, verticle)
     
 
@@ -319,23 +286,20 @@ def net_process(model, image, mean, std=None, flip=False, image_name=None, featu
         input = torch.cat([input, input.flip(3)], 0)
     with torch.no_grad():
         if args.arch=='unet':
-            maps = model(input)   
-            #import ipdb;ipdb.set_trace()         
+            import ipdb;ipdb.set_trace()
+            maps = model(input)            
             output = model.module.last.out(maps)            
             maps = maps.detach().cpu()#.numpy()
         else:
-            output, maps = model(input)
+            output = model(input)
     #plot_posterior(output[0].detach().cpu(), image_name, feature_folder)
     _, _, h_i, w_i = input.shape
     _, _, h_o, w_o = output.shape
     if (h_o != h_i) or (w_o != w_i):
         output = F.interpolate(output, (h_i, w_i), mode='bilinear', align_corners=True)
-
-    maps = maps[0].detach().cpu().numpy()
     #import ipdb;ipdb.set_trace()
-
-
-    plot_features(maps, image_name, feature_folder)
+    maps = maps[0]
+    #plot_features(maps, image_name, feature_folder)
     #maps = model.module.feature_map
     #output_before_softmax = torch.clone(output)[0]
     output = F.softmax(output, dim=1)
@@ -388,8 +352,6 @@ def find_nearest_idx(array, value):
 
 def power_spectra(data, freq_path):    
     global args
-    #d2 = torch.device('cuda:1')
-    #import ipdb;ipdb.set_trace()
     d2 = torch.device('cuda:1')
     first = True
     first_amp = True
@@ -447,7 +409,7 @@ def power_spectra(data, freq_path):
 
 def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, crop_w, scales, gray_folder, color_folder, freq_folder, colors, feature_folder=None):
     logger.info('>>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>')
-    global maps, output_before_softmax, args
+    global maps, output_before_softmax
     all_maps = []    
     
     data_time = AverageMeter()
@@ -487,7 +449,7 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
         check_makedirs(color_folder)
         check_makedirs(freq_folder)
         gray = np.uint8(prediction)
-        
+        all_maps.append(maps)#.transpose(1,2,0))
         
         color = colorize(gray, colors)
         #image_path, _ = data_list[i]
@@ -499,9 +461,7 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
 
         
         color.save(color_path)
-        all_maps.append(torch.tensor(maps))#.transpose(1,2,0))
-    if args.testing:
-        power_spectra(all_maps, freq_folder)
+    #power_spectra(all_maps, freq_folder)
     
 
     logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')

@@ -19,7 +19,7 @@ import torch.distributed as dist
 from tensorboardX import SummaryWriter
 
 from util import dataset, transform, config
-from util.util import MSELoss, AverageMeter, poly_learning_rate, intersectionAndUnion, intersectionAndUnionGPU, find_free_port
+from util.util import MSELoss, AverageMeter, poly_learning_rate, intersectionAndUnion, intersectionAndUnionGPU, find_free_port, check_makedirs
 
 cv2.ocl.setUseOpenCL(False)
 cv2.setNumThreads(0)
@@ -37,7 +37,9 @@ def get_parser():
     return cfg
 
 
-def get_logger():
+def get_logger(save_folder):
+    log_path = str(save_folder) + '/log.log'
+    logging.basicConfig(filename=log_path, filemode='a')
     logger_name = "main-logger"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
@@ -122,13 +124,14 @@ def main_worker(gpu, ngpus_per_node, argss):
             args.rank = int(os.environ["RANK"])
         if args.multiprocessing_distributed:
             args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, 
+    dist.init_process_group(backend=args.dist_backend, 
                                 init_method=args.dist_url, 
                                 world_size=args.world_size, 
                                 rank=args.rank)
+                                #rank=2)
 
-    if hasattr(args, 'criterion') and ('mse' in args.criterion):
-        criterion = MSELoss(ignore_index=args.ignore_label)
+    if hasattr(args, 'criterion') and ('l1' in args.criterion):
+        criterion = nn.L1Loss(ignore_index=args.ignore_label)
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
     args.trans_kernel = [2, 2, 2] if not hasattr(args, 'trans_kernel') else [int(args.trans_kernel), int(args.trans_kernel), int(args.trans_kernel)]
@@ -136,14 +139,24 @@ def main_worker(gpu, ngpus_per_node, argss):
     args.use_convnext_backbone = False if not hasattr(args, 'use_convnext_backbone') else args.use_convnext_backbone
     args.small_trans = 0 if not hasattr(args, 'small_trans') else int(args.small_trans)
     args.small_conv = 0 if not hasattr(args, 'small_conv') else int(args.small_conv)
+    args.psp_kernel = 0 if not hasattr(args, 'psp_kernel') else int(args.psp_kernel)
+    args.freq_upscale = False if not hasattr(args, 'freq_upscale') else args.freq_upscale
         
     if args.arch == 'psp':
-        from model.pspnet import PSPNet
-        model = PSPNet(layers=args.layers, classes=args.classes, 
-                        zoom_factor=args.zoom_factor, criterion=criterion)
-        modules_ori = [model.layer0, model.layer1, model.layer2, 
-                        model.layer3, model.layer4]
-        modules_new = [model.ppm, model.cls, model.aux]
+        if args.psp_kernel>0:
+            from model.pspnet_kernels import PSPNet
+            model = PSPNet(layers=args.layers, classes=args.classes, 
+                            zoom_factor=args.zoom_factor, criterion=criterion, psp_kernel=args.psp_kernel)
+            modules_ori = [model.layer0, model.layer1, model.layer2, 
+                            model.layer3, model.layer4]
+            modules_new = [model.ppm, model.large_kernels, model.cls, model.aux]    
+        else:
+            from model.pspnet import PSPNet
+            model = PSPNet(layers=args.layers, classes=args.classes, 
+                            zoom_factor=args.zoom_factor, criterion=criterion)
+            modules_ori = [model.layer0, model.layer1, model.layer2, 
+                            model.layer3, model.layer4]
+            modules_new = [model.ppm, model.cls, model.aux]
     elif args.arch == 'psa':
         from model.psanet import PSANet
         model = PSANet(layers=args.layers, classes=args.classes, 
@@ -161,7 +174,10 @@ def main_worker(gpu, ngpus_per_node, argss):
                                 'convnext_large', 'convnext_xlarge']
         slak_backbones = ['SLaK_tiny', 'SLaK_small', 'SLaK_base']
         if args.backbone in backbones:
-            from model.unet import UNetResnet
+            if args.freq_upscale:
+                from model.unet_freq_up import UNetResnet
+            else:
+                from model.unet import UNetResnet
             model = UNetResnet(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
@@ -175,7 +191,10 @@ def main_worker(gpu, ngpus_per_node, argss):
             modules_new=[model.decoder1, model.decoder2, 
                         model.decoder3, model.decoder4, model.last]
         elif args.backbone in convnext_backbones:
-            from model.unet import UNetConvNeXt
+            if args.freq_upscale:
+                from model.unet_freq_up import UNetConvNeXt
+            else:
+                from model.unet import UNetConvNeXt
             model = UNetConvNeXt(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
                                 pretrained=args.pretrained,
@@ -189,7 +208,10 @@ def main_worker(gpu, ngpus_per_node, argss):
             modules_new=[model.decoder1, model.decoder2, 
                         model.decoder3, model.decoder4, model.last]
         elif args.backbone in slak_backbones:
-            from model.unet import UNetSLaK
+            if args.freq_upscale:
+                from model.unet_freq_up import UNetSLaK
+            else:
+                from model.unet import UNetSLaK
             args.pretrained= True if args.width_factor==1.3 else False
             model = UNetSLaK(num_classes=args.classes,
                                 in_channels=3, backbone=args.backbone,
@@ -224,7 +246,7 @@ def main_worker(gpu, ngpus_per_node, argss):
         modules_new=[model.dec1, model.dec2, model.dec3,
                     model.dec4, model.last]
     else:
-        raise Exception('architecture not supported yet'.format(args.arch))
+        raise Exception('{} architecture not supported yet'.format(args.arch))
     params_list = []
     for module in modules_ori:
         if args.arch=='unet' and args.backbone not in backbones:
@@ -249,22 +271,24 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     if main_process():
         global logger, writer
-        logger = get_logger()
+        check_makedirs(args.save_folder)
+        logger = get_logger(args.save_folder)
         writer = SummaryWriter(args.save_path)
         logger.info(args)
         logger.info("=> creating model ...")
         logger.info("Classes: {}".format(args.classes))
         logger.info(model)
+    model.cuda()
     if args.distributed:
         #torch.cuda.set_device(gpu)
         args.batch_size = int(args.batch_size / ngpus_per_node)
         args.batch_size_val = int(args.batch_size_val / ngpus_per_node)
         args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-        #model = torch.nn.parallel.DistributedDataParallel(model.cuda(), device_ids=[gpu])
-        model = torch.nn.parallel.DistributedDataParallel(model.to(args.device), find_unused_parameters=True)#, device_ids=[gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+        #model = torch.nn.parallel.DistributedDataParallel(model.to(args.device), find_unused_parameters=True)#, device_ids=[gpu])
     else:
-        #model = torch.nn.DataParallel(model.cuda())
-        model = torch.nn.DataParallel(model.to(args.device))
+        model = torch.nn.DataParallel(model)
+        #model = torch.nn.DataParallel(model.to(args.device))
 
     if args.weight:
         if os.path.isfile(args.weight):
@@ -298,6 +322,7 @@ def main_worker(gpu, ngpus_per_node, argss):
             if main_process():
                 logger.info("=> no checkpoint found at '{}'".format(args.resume))
 
+    #import ipdb;ipdb.set_trace()
     value_scale = 255
     mean = [0.485, 0.456, 0.406]
     mean = [item * value_scale for item in mean]
@@ -343,10 +368,12 @@ def main_worker(gpu, ngpus_per_node, argss):
                             num_workers=args.workers, pin_memory=True, 
                             sampler=val_sampler)
 
+    scheduler = None
     if args.use_cosine_annealing:
         max_iterations = math.floor(len(train_data)/args.batch_size)*args.epochs
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iterations, verbose=False)
 
+    best_miou = 0
     for epoch in range(args.start_epoch, args.epochs):
         epoch_log = epoch + 1
         if args.distributed:
@@ -374,9 +401,16 @@ def main_worker(gpu, ngpus_per_node, argss):
                 writer.add_scalar('mIoU_val', mIoU_val, epoch_log)
                 writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
                 writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
+                if mIoU_val > best_miou:
+                    best_miou = mIoU_val
+                    best_filename=args.save_path + '/best_model.pth'
+                    logger.info('Saving best checkpoint so far to: ' + best_filename)
+                    torch.save({'epoch': epoch_log, 'state_dict': model.state_dict(), 
+                        'optimizer': optimizer.state_dict()}, best_filename)
 
 
-def train(train_loader, model, optimizer, epoch, scheduler):
+
+def train(train_loader, model, optimizer, epoch, scheduler=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     main_loss_meter = AverageMeter()
@@ -385,6 +419,7 @@ def train(train_loader, model, optimizer, epoch, scheduler):
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()
+    global args
 
     model.train()
     end = time.time()
@@ -403,9 +438,10 @@ def train(train_loader, model, optimizer, epoch, scheduler):
         #target = target.cuda(non_blocking=True)
         input = input.to(args.device)
         target = target.to(args.device)
-        #import ipdb;ipdb.set_trace()
         if args.arch=='unet':            
             output = model(input)
+            #import ipdb;ipdb.set_trace()
+            output = model.module.last.out(output)
             loss = model.module.criterion(output, target)
             
             #print("intput: ", torch.mean(input))
@@ -429,7 +465,8 @@ def train(train_loader, model, optimizer, epoch, scheduler):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        scheduler.step()
+        if args.use_cosine_annealing:
+            scheduler.step()
 
         n = input.size(0)
         if args.multiprocessing_distributed:
@@ -519,7 +556,10 @@ def validate(val_loader, model, criterion):
         #target = target.cuda(non_blocking=True)
         input = input.to(args.device)
         target = target.to(args.device)
-        output = model(input)
+        try:
+            output, _ = model(input)
+        except Exception:
+            output = model(input)
         if args.zoom_factor != 8:
             output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)
         loss = criterion(output, target)

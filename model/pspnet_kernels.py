@@ -27,8 +27,19 @@ class PPM(nn.Module):
         return torch.cat(out, 1)
 
 
+class Eleven(nn.Module):
+    def __init__(self, psp_kernel, fea_dim):
+        super(Eleven, self).__init__()
+        #fea_dim = 2048
+        self.layer1=nn.Conv2d(fea_dim, 512, kernel_size=psp_kernel, stride=1, padding=4, bias=False, groups=512)
+        self.layer2=nn.Conv2d(fea_dim, 512, kernel_size=3, stride=1, padding=0, bias=False, groups=512)
+    def forward(self, x):
+        #layer1_out = layer1(x)
+        #layer2_out = layer2(x)
+        return self.layer1(x) + self.layer2(x)
+
 class PSPNet(nn.Module):
-    def __init__(self, layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=2, zoom_factor=8, use_ppm=True, criterion=nn.CrossEntropyLoss(ignore_index=255), pretrained=True):
+    def __init__(self, layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=2, zoom_factor=8, use_ppm=True, criterion=nn.CrossEntropyLoss(ignore_index=255), pretrained=True, psp_kernel=None):
         super(PSPNet, self).__init__()
         assert layers in [50, 101, 152]
         assert 2048 % len(bins) == 0
@@ -63,8 +74,14 @@ class PSPNet(nn.Module):
             self.ppm = PPM(fea_dim, int(fea_dim/len(bins)), bins)
             fea_dim *= 2
         
+        if psp_kernel !=11:
+            self.large_kernels = nn.Conv2d(fea_dim, 512, kernel_size=psp_kernel, stride=1, padding=0, bias=False, groups=512)
+        else:
+            self.large_kernels = Eleven(psp_kernel, fea_dim)
+        
+        
         self.cls = nn.Sequential(
-            nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False, groups=512),
+            nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=dropout),
@@ -114,7 +131,8 @@ class PSPNet(nn.Module):
         #x=feature_map
         #x=self.cls(x)
         #x = self.cls(x)
-        feature_map = self.cls[0](x)
+        #feature_map = self.cls[0](x)
+        feature_map = self.large_kernels(x)
         x = self.cls[4](self.cls[3](self.cls[2](self.cls[1](feature_map))))
         if self.zoom_factor != 1:
             x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=True)

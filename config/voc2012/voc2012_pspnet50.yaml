@@ -7,6 +7,11 @@ DATA:
 TRAIN:
   arch: psp
   layers: 50
+  backbone: resnet
+  optimizer: sgd
+  pretrained: False
+  criterion: cross_entropy
+  use_cosine_annealing: True
   sync_bn: True  # adopt sync_bn or not
   train_h: 473
   train_w: 473
@@ -23,12 +28,14 @@ TRAIN:
   workers: 64  # data loader workers
   batch_size: 16  # batch size for training
   batch_size_val: 8  # batch size for validation during training, memory and speed tradeoff
-  base_lr: 0.01
-  epochs: 50
+  #base_lr: 0.01
+  base_lr: 0.0001
+  epochs: 100
   start_epoch: 0
   power: 0.9
   momentum: 0.9
-  weight_decay: 0.0001
+  #weight_decay: 0.0001
+  weight_decay: 0.05
   manual_seed:
   print_freq: 10
   save_freq: 1

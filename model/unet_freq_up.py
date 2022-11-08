@@ -122,6 +122,26 @@ class decoder(nn.Module):
         x = self.up_conv(x)
         return x
 
+class FFT_Up_Sampling(nn.Module):
+    # Code from Julias from : "Pooling from Grabniski, J., et al, 2022. FrequencyLowCut Pooling - Plug & Play against Catastrophic Overfitting
+    # pooling trough selecting only the low frequency part in the Fourier Domain and only using this part to go back into the spacial domain
+    # save computations as we do not need to do through conv with stride 2"
+    # This is: "upsampling in kspace by zero padding"
+    def __init__(self, factor):
+        super(FFT_Up_Sampling, self).__init__()
+        self.factor = factor
+
+    def forward(self, x):
+        pad1 = int(((x.size()[2]*self.factor)-x.size()[2])/2)
+        pad2 = int(((x.size()[3]*self.factor)-x.size()[3])/2)
+        low_part = F.pad(torch.fft.fftshift(torch.fft.fft2(x)), (pad2, pad2, pad1, pad1), "constant", 0) 
+        #low_part = F.pad(torch.fft.fftshift(torch.fft.fft2(x)), (pad1, pad2, pad1, pad2), "constant", 0) 
+        #low_part = F.pad(torch.fft.fftshift(torch.fft.fft2(tmp)), (pad2, pad2, pad1, pad1), "constant", 0) 
+        #pad1 = int(((tmp.size()[2]*self.factor)-tmp.size()[2])/2)
+        #pad2 = int(((tmp.size()[3]*self.factor)-tmp.size()[3])/2)
+        #import ipdb;ipdb.set_trace()
+        return torch.fft.ifft2(torch.fft.ifftshift(low_part)).real
+
 
 class decoder_resnet(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=2, 
@@ -137,25 +157,39 @@ class decoder_resnet(nn.Module):
 
         #groups=pos2 if (kernel_size>2 and pos1%pos2==0) else 1         
         groups=math.gcd(pos1, pos2) if kernel_size>2 else 1 
-        self.up = nn.ConvTranspose2d(pos1, pos2, kernel_size=kernel_size, 
-                                    stride=2, padding=padding, groups=groups, 
-                                    output_padding=output_padding)
+        #self.up = nn.ConvTranspose2d(pos1, pos2, kernel_size=kernel_size, 
+        #                            stride=2, padding=padding, groups=groups, 
+        #                            output_padding=output_padding)
+        #tmp3 = nn.Conv2d(768,384,kernel_size=7, stride=1, padding=int(7//2))
+        """
+        nn.Sequential(fft_upconv from class FFT upsampling from mattermost) 
+        factor 2, 
+        no more upsampling using convtransposed2d but conv2d, stride 1, padding=1, in_channels and out channels are same
+        """        
+        self.up = nn.Sequential(FFT_Up_Sampling(factor=2), nn.Conv2d(pos1, pos2, kernel_size=kernel_size,
+                                                                    stride=1, padding= 0 if kernel_size ==2 else int(kernel_size//2), groups=groups))
+        #self.up = FFT_Up_Sampling(factor=stride)
         self.up_conv = backbone_convnext(int(in_channels), out_channels, 
                                             kernel_size=backbone_kernel, small_conv=small_conv) \
                         if use_convnext_backbone else backbone_conv(int(in_channels), out_channels)
-        self.small_trans_kernel = nn.ConvTranspose2d(pos1, pos2, kernel_size=small_trans, 
-                                    stride=2, padding=(small_trans-1)//2, groups=groups, 
-                                    output_padding=output_padding) if small_trans!=0 else None
+        #self.small_trans_kernel = nn.ConvTranspose2d(pos1, pos2, kernel_size=small_trans, 
+        #                            stride=2, padding=(small_trans-1)//2, groups=groups, 
+        #                            output_padding=output_padding) if small_trans!=0 else None
+        self.small_trans_kernel = nn.Sequential(FFT_Up_Sampling(factor=2), nn.Conv2d(pos1, pos2, kernel_size=small_trans,
+                                                                    stride=1, padding=0 if small_trans==2 else int(small_trans//2), groups=groups)) if small_trans!=0 else None
 
     def forward(self, x_copy, x, interpolate=True):       
         # Concatenate
         #x1 = self.up(x)
         #x = (x1 + self.small_trans_kernel(x)) if self.small_trans_kernel != None else x
         #x = self.up(x) + (self.small_trans_kernel(x) if self.small_trans_kernel != None else None)
+        #import ipdb;ipdb.set_trace()
         if self.small_trans_kernel != None:
             x = self.up(x) + self.small_trans_kernel(x)
         else:
             x = self.up(x)
+        if self.up[1].kernel_size[0]==2:
+            x=F.pad(x, (0,1,0,1),"constant", 0)
         x = torch.cat([x_copy, x], dim=1)
         x = self.up_conv(x)        
         return x
@@ -372,7 +406,7 @@ class UNetResnet(BaseModel):
         x = self.last.norm(self.last.conv(x))
         x = self.last.lastup(x)
         #self.feature_map = torch.clone(x)
-        x = self.last.out(x)
+        #x = self.last.out(x)
 
         """
         H, W = x.size(2), x.size(3)
@@ -405,7 +439,7 @@ class UNetResnet(BaseModel):
         x = self.conv7(self.conv6(x))
         """
 
-        return x, self.feature_map
+        return x #, self.feature_map
 
     def get_backbone_params(self):
         return chain(self.initial.parameters(), self.layer1.parameters(), self.layer2.parameters(), 
@@ -427,6 +461,14 @@ class UNetResnet(BaseModel):
         A PyTorch impl of : `A ConvNet for the 2020s`  -
           https://arxiv.org/pdf/2201.03545.pdf
 """
+
+class Freq_Upsampled(nn.Module):
+    def __init__(self, factor, input_channels, output_channels, kernel_size=1, stride=1):
+        super(Freq_Upsampled, self).__init__()
+        self.freq = FFT_Up_Sampling(factor)
+        self.conv = nn.Linear(input_channels, out_channels)#, kernel_size=kernel_size, stride=stride)
+    def forward(self, x):
+        return self.conv(self.freq(x))
 
 class UNetConvNeXt(BaseModel):
     def __init__(self, num_classes, in_channels=3, backbone='convnext_tiny', 
@@ -480,8 +522,9 @@ class UNetConvNeXt(BaseModel):
                                 ("conv", nn.Conv2d(int(base_width/4), 
                                 int(base_width/8), kernel_size=1)),
                                 ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/8)))),
-                                ("lastup", nn.ConvTranspose2d(int(base_width/8),
-                                    int(base_width/8), kernel_size=4, stride=4)),
+                                #("lastup", nn.ConvTranspose2d(int(base_width/8),
+                                #    int(base_width/8), kernel_size=4, stride=4)),
+                                ("lastup", FFT_Up_Sampling(4)), #Freq_Upsampled(4, int(base_width/8), )),
                                 ("out", nn.Conv2d(int(base_width/8), 
                                 num_classes, kernel_size=1))]))
         """
@@ -539,8 +582,9 @@ class UNetConvNeXt(BaseModel):
         #x = self.last.up(x)        
         x = torch.cat([x0, x], dim=1)
         x = self.last.norm(self.last.conv(x))
+        #import ipdb;ipdb.set_trace()
         x = self.last.lastup(x)
-        #self.feature_map = torch.clone(x).tolist()#.detach()#.to(torch.device('cuda:1'))
+        #self.feature_map = torch.clone(x).tolist()#.detach()#.to(torch.device('cuda:1'))        
         #x = self.last.out(x)
         return x
 
@@ -580,11 +624,11 @@ class UNetSLaK(BaseModel):
                                         width_factor=width_factor, Decom=Decom, bn=bn)
         if pretrained:
             if 'tiny' in backbone:
-                checkpoint = torch.load("/work/ws-tmp/sa058646-segment2/SLaK/models/SLaK_tiny_checkpoint.pth", map_location=torch.device('cpu'))['model']
+                checkpoint = torch.load("/work/ws-tmp/sa058646-segment/SLaK/models/SLaK_tiny_checkpoint.pth", map_location=torch.device('cpu'))['model']
             elif 'small' in backbone:
-                checkpoint = torch.load("/work/ws-tmp/sa058646-segment2/SLaK/models/SLaK_small_checkpoint.pth", map_location=torch.device('cpu'))['model']
+                checkpoint = torch.load("/work/ws-tmp/sa058646-segment/SLaK/models/SLaK_small_checkpoint.pth", map_location=torch.device('cpu'))['model']
             elif 'base' in backbone:
-                checkpoint = torch.load("/work/ws-tmp/sa058646-segment2/SLaK/models/SLaK_base_checkpoint.pth", map_location=torch.device('cpu'))['model']
+                checkpoint = torch.load("/work/ws-tmp/sa058646-segment/SLaK/models/SLaK_base_checkpoint.pth", map_location=torch.device('cpu'))['model']
             else:
                 raise NotImplementedError('pretrained specified for an architecture that is not supported!')
             model.load_state_dict(checkpoint)
@@ -623,8 +667,9 @@ class UNetSLaK(BaseModel):
                                 ("conv", nn.Conv2d(int(base_width/8)*2, 
                                 int(base_width/8), kernel_size=1)),
                                 ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/8)))),
-                                ("lastup", nn.ConvTranspose2d(int(base_width/8),
-                                    int(base_width/8), kernel_size=4, stride=4)),
+                                #("lastup", nn.ConvTranspose2d(int(base_width/8),
+                                #    int(base_width/8), kernel_size=4, stride=4)),
+                                ("lastup", FFT_Up_Sampling(4)),
                                 ("out", nn.Conv2d(int(base_width/8), 
                                 num_classes, kernel_size=1))]))
         """

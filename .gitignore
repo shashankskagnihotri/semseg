@@ -71,9 +71,11 @@ back/
 *.jpeg
 *.log
 *.pth
+*.pt
+*.npy
 #*.txt
 events*
-config/
+#config/
 dataset/
 *.ninja_deps
 *.ninja_log
