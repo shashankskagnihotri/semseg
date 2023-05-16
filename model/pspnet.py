@@ -27,7 +27,7 @@ class PPM(nn.Module):
 
 
 class PSPNet(nn.Module):
-    def __init__(self, layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=2, zoom_factor=8, use_ppm=True, criterion=nn.CrossEntropyLoss(ignore_index=255), pretrained=True):
+    def __init__(self, layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=2, zoom_factor=8, use_ppm=True, criterion=nn.CrossEntropyLoss(ignore_index=255, reduction='none'), pretrained=True):
         super(PSPNet, self).__init__()
         assert layers in [50, 101, 152]
         assert 2048 % len(bins) == 0
@@ -62,7 +62,7 @@ class PSPNet(nn.Module):
             self.ppm = PPM(fea_dim, int(fea_dim/len(bins)), bins)
             fea_dim *= 2
         self.cls = nn.Sequential(
-            nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False, groups=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=dropout),
@@ -91,6 +91,8 @@ class PSPNet(nn.Module):
         if self.use_ppm:
             x = self.ppm(x)
         x = self.cls(x)
+        #print("\n\n\t\t\tINSIDE PSPNet x.shape: {}".format(x.shape))
+        #import ipdb;ipdb.set_trace()
         if self.zoom_factor != 1:
             x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=True)
 
@@ -100,7 +102,8 @@ class PSPNet(nn.Module):
                 aux = F.interpolate(aux, size=(h, w), mode='bilinear', align_corners=True)
             main_loss = self.criterion(x, y)
             aux_loss = self.criterion(aux, y)
-            return x.max(1)[1], main_loss, aux_loss
+            #return x.max(1)[1], main_loss, aux_loss
+            return x, main_loss, aux_loss
         else:
             return x
 

@@ -21,6 +21,8 @@ from util.util import AverageMeter, intersectionAndUnion, check_makedirs, colori
 
 cv2.ocl.setUseOpenCL(False)
 
+criterion = torch.nn.CrossEntropyLoss(ignore_index=255)
+
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
@@ -35,7 +37,10 @@ def get_parser():
     return cfg
 
 
-def get_logger():
+def get_logger(save_folder):
+    check_makedirs(save_folder)
+    log_path = str(save_folder) + '/log.log'
+    logging.basicConfig(filename=log_path, filemode='a')
     logger_name = "main-logger"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
@@ -74,7 +79,7 @@ def main():
     global args, logger
     args = get_parser()
     check(args)
-    logger = get_logger()
+    logger = get_logger(args.save_folder)
     os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.test_gpu)
     logger.info(args)
     logger.info("=> creating model ...")
@@ -96,6 +101,7 @@ def main():
         index_end = len(test_data.data_list)
     else:
         index_end = min(index_start + args.index_step, len(test_data.data_list))
+    index_end = args.index_end
     test_data.data_list = test_data.data_list[index_start:index_end]
     test_loader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
     colors = np.loadtxt(args.colors_path).astype('uint8')
@@ -113,6 +119,10 @@ def main():
         logger.info(model)
         model = torch.nn.DataParallel(model).cuda()
         cudnn.benchmark = True
+        #import ipdb;ipdb.set_trace()
+        model.module.cls[0]=torch.nn.Conv2d(in_channels=model.module.cls[0].in_channels, out_channels=model.module.cls[0].out_channels, 
+                                            kernel_size=model.module.cls[0].kernel_size, stride=model.module.cls[0].stride, 
+                                            padding=model.module.cls[0].padding, groups=1).cuda()
         if os.path.isfile(args.model_path):
             logger.info("=> loading checkpoint '{}'".format(args.model_path))
             checkpoint = torch.load(args.model_path)
@@ -124,9 +134,39 @@ def main():
     if args.split != 'test':
         cal_acc(test_data.data_list, gray_folder, args.classes, names)
 
+# FGSM attack code
+def fgsm_attack(image, epsilon, data_grad, clip_min, clip_max, alpha):
+    # Collect the element-wise sign of the data gradient
+    sign_data_grad = data_grad.sign()
+    # Create the perturbed image by adjusting each pixel of the input image
+    perturbed_image = image + alpha*sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
+    # Return the perturbed image
+    return perturbed_image
 
-def net_process(model, image, mean, std=None, flip=True):
+
+def net_process(model, image, target, mean, std=None, flip=False, iterations=1, epsilon=0.1, alpha=0.1):
+    global args, criterion
     input = torch.from_numpy(image.transpose((2, 0, 1))).float()
+    target = torch.from_numpy(target.astype(np.int64))
+    if hasattr(args, 'epsilon'):
+        epsilon = args.epsilon
+    if hasattr(args, 'iterations'):
+        iterations = args.iterations
+    if hasattr(args, 'alpha'):
+        alpha = args.alpha
+    if hasattr(args, 'attack'):
+        attack = args.attack
+    else:
+        attack = 'fgsm'
+    
+    if attack == 'fgsm':
+        iterations = 1
+        alpha = epsilon
+    if attack == 'segpgd':
+        alpha = 0.01
+
     if std is None:
         for t, m in zip(input, mean):
             t.sub_(m)
@@ -134,10 +174,57 @@ def net_process(model, image, mean, std=None, flip=True):
         for t, m, s in zip(input, mean, std):
             t.sub_(m).div_(s)
     input = input.unsqueeze(0).cuda()
+    target = target.unsqueeze(0).cuda()
+
     if flip:
         input = torch.cat([input, input.flip(3)], 0)
-    with torch.no_grad():
+    
+    if attack == 'cospgd' or attack=='segpgd':
+        #if iterations ==1:
+        #epsilon = epsilon/255
+        input = input + torch.FloatTensor(input.shape).uniform_(-1*epsilon, epsilon).cuda()
+
+    clip_min, clip_max = input.min(), input.max()
+
+    input.requires_grad=True
+    input.retain_grad()
+    #import ipdb;ipdb.set_trace()    
+
+    with torch.enable_grad():
+        #output, _ = model(input)
         output = model(input)
+        for t in range(iterations):
+            #import ipdb;ipdb.set_trace()
+            
+            #import ipdb;ipdb.set_trace()
+            loss = criterion(output, target)    
+            if attack == 'segpgd':
+                lambda_t = t/(2*iterations)
+                output_idx=torch.argmax(output, dim=1)
+                loss=torch.sum(torch.where(output_idx==target, (1-lambda_t)*loss, lambda_t*loss))/(output.shape[-2]*output.shape[-1])
+            elif attack == 'cospgd':
+                shape=[input.shape[0], 21, input.shape[2], input.shape[3]]
+                one_hot_target = torch.zeros(shape).cuda()
+                for i in range(target.shape[1]):
+                    for j in range(target.shape[2]):
+                        one_hot_target[0][target[0][i][j]][i][j]=1
+                eps=10**-8
+                cossim=F.cosine_similarity(torch.sigmoid(output)+eps, one_hot_target+eps, dim=1, eps=10**-20)
+                loss = torch.sum(cossim*loss)/(output.shape[-2]*output.shape[-1])
+
+
+            model.zero_grad()
+            loss.backward(retain_graph=True)
+            data_grad = input.grad
+            input = fgsm_attack(input, epsilon, data_grad, clip_min, clip_max, alpha)
+            #output, _ = model(input)
+            output = model(input)
+            input.retain_grad()
+        #if flip:
+        #    input1, input2 = torch.split(input, 1)
+
+
+
     _, _, h_i, w_i = input.shape
     _, _, h_o, w_o = output.shape
     if (h_o != h_i) or (w_o != w_i):
@@ -152,7 +239,7 @@ def net_process(model, image, mean, std=None, flip=True):
     return output
 
 
-def scale_process(model, image, classes, crop_h, crop_w, h, w, mean, std=None, stride_rate=2/3):
+def scale_process(model, image, target, classes, crop_h, crop_w, h, w, mean, std=None, stride_rate=2/3):
     ori_h, ori_w, _ = image.shape
     pad_h = max(crop_h - ori_h, 0)
     pad_w = max(crop_w - ori_w, 0)
@@ -160,6 +247,7 @@ def scale_process(model, image, classes, crop_h, crop_w, h, w, mean, std=None, s
     pad_w_half = int(pad_w / 2)
     if pad_h > 0 or pad_w > 0:
         image = cv2.copyMakeBorder(image, pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=mean)
+        target = cv2.copyMakeBorder(target, pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=int(target.min()))
     new_h, new_w, _ = image.shape
     stride_h = int(np.ceil(crop_h*stride_rate))
     stride_w = int(np.ceil(crop_w*stride_rate))
@@ -176,8 +264,9 @@ def scale_process(model, image, classes, crop_h, crop_w, h, w, mean, std=None, s
             e_w = min(s_w + crop_w, new_w)
             s_w = e_w - crop_w
             image_crop = image[s_h:e_h, s_w:e_w].copy()
+            target_crop = target[s_h:e_h, s_w:e_w].copy()
             count_crop[s_h:e_h, s_w:e_w] += 1
-            prediction_crop[s_h:e_h, s_w:e_w, :] += net_process(model, image_crop, mean, std)
+            prediction_crop[s_h:e_h, s_w:e_w, :] += net_process(model, image_crop, target_crop, mean, std)
     prediction_crop /= np.expand_dims(count_crop, 2)
     prediction_crop = prediction_crop[pad_h_half:pad_h_half+ori_h, pad_w_half:pad_w_half+ori_w]
     prediction = cv2.resize(prediction_crop, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -190,10 +279,12 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
     batch_time = AverageMeter()
     model.eval()
     end = time.time()
-    for i, (input, _) in enumerate(test_loader):
+    for i, (input, label) in enumerate(test_loader):
         data_time.update(time.time() - end)
         input = np.squeeze(input.numpy(), axis=0)
         image = np.transpose(input, (1, 2, 0))
+        #label = np.squeeze(label.numpy(), axis=0)
+        target = np.transpose(label.numpy(), (1, 2,0)).astype(np.float32)
         h, w, _ = image.shape
         prediction = np.zeros((h, w, classes), dtype=float)
         for scale in scales:
@@ -205,7 +296,8 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
             else:
                 new_h = round(long_size/float(w)*h)
             image_scale = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            prediction += scale_process(model, image_scale, classes, crop_h, crop_w, h, w, mean, std)
+            target_scale = cv2.resize(target, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            prediction += scale_process(model, image_scale, target_scale, classes, crop_h, crop_w, h, w, mean, std)
         prediction /= len(scales)
         prediction = np.argmax(prediction, axis=2)
         batch_time.update(time.time() - end)

@@ -10,8 +10,8 @@ import torch.nn.functional as F
 import torch.nn.parallel
 import torch.utils.data
 
-from util import config
-from util.util import colorize
+from .util import config
+from .util.util import colorize
 
 cv2.ocl.setUseOpenCL(False)
 

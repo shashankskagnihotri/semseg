@@ -75,3 +75,4 @@ dataset/
 *.yaml
 slurm*
 initmodel
+psp2/

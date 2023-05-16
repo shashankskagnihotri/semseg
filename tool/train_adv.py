@@ -17,6 +17,11 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from tensorboardX import SummaryWriter
 
+import sys
+
+file_dir = os.path.dirname("/work/ws-tmp/sa058646-segment/PSPNet/util")
+sys.path.append(file_dir)
+
 from util import dataset, transform, config
 from util.util import AverageMeter, poly_learning_rate, intersectionAndUnionGPU, find_free_port
 
@@ -118,8 +123,10 @@ def main_worker(gpu, ngpus_per_node, argss):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size, rank=args.rank)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
+    criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label, reduction='none')
     if args.arch == 'psp':
+        file_dir = os.path.dirname("/work/ws-tmp/sa058646-segment/PSPNet/model")
+        sys.path.append(file_dir)
         from model.pspnet import PSPNet
         model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, criterion=criterion)
         modules_ori = [model.layer0, model.layer1, model.layer2, model.layer3, model.layer4]
@@ -243,6 +250,16 @@ def main_worker(gpu, ngpus_per_node, argss):
                 writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
                 writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
 
+# FGSM attack code
+def fgsm_attack(image, epsilon, data_grad, clip_min, clip_max, alpha):
+    # Collect the element-wise sign of the data gradient
+    sign_data_grad = data_grad.sign()
+    # Create the perturbed image by adjusting each pixel of the input image
+    perturbed_image = image + alpha*sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
+    # Return the perturbed image
+    return perturbed_image
 
 def train(train_loader, model, optimizer, epoch):
     batch_time = AverageMeter()
@@ -254,10 +271,28 @@ def train(train_loader, model, optimizer, epoch):
     union_meter = AverageMeter()
     target_meter = AverageMeter()
 
+    if hasattr(args, 'epsilon'):
+        epsilon = args.epsilon
+    if hasattr(args, 'iterations'):
+        iterations = args.iterations
+    if hasattr(args, 'alpha'):
+        alpha = args.alpha
+    if hasattr(args, 'attack'):
+        attack = args.attack
+    else:
+        attack = 'fgsm'
+    
+    if attack == 'fgsm':
+        iterations = 1
+        alpha = 0.03
+    if attack == 'segpgd':
+        alpha = 0.01
+
     model.train()
     end = time.time()
     max_iter = args.epochs * len(train_loader)
     for i, (input, target) in enumerate(train_loader):
+        #print("\nINITIAL TARGET\nmin: {}\nmax: {}\nshape: {}".format(target.min(), target.max(), target.shape))
         data_time.update(time.time() - end)
         if args.zoom_factor != 8:
             h = int((target.size()[1] - 1) / 8 * args.zoom_factor + 1)
@@ -266,14 +301,69 @@ def train(train_loader, model, optimizer, epoch):
             target = F.interpolate(target.unsqueeze(1).float(), size=(h, w), mode='bilinear', align_corners=True).squeeze(1).long()
         input = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
+        input_adv =  input[int(len(input)/2):,:,:,:]
+        target_adv = target[int(len(target)/2):,:,:]
+        #print("\t\tinput_adv shape: {}\n\t\ttarget_adv shape: {}".format(input_adv.shape, target_adv.shape))
+        clip_min, clip_max = input_adv.min()-epsilon, input_adv.max()+epsilon
+        if attack == 'cospgd' or attack=='segpgd':
+            input_adv = input_adv + torch.FloatTensor(input_adv.shape).uniform_(-1*epsilon, epsilon).cuda()
+        input_adv.requires_grad=True
+        input_adv.retain_grad()
+        
+        
+        if i>1:
+            for t in range(iterations):
+                output, main_loss, aux_loss = model(input_adv, target_adv)
+                if not args.multiprocessing_distributed:
+                    main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
+                loss = main_loss + args.aux_weight * aux_loss
+                if attack == 'segpgd':
+                    lambda_t = t/(2*iterations)
+                    output_idx=torch.argmax(output, dim=1)
+                    #print("\t\toutput shape: {}".format(output.shape))
+                    #print("\t\toutput_idx shape: {}\n\t\ttarget_adv shape: {}".format(output_idx.shape, target_adv.shape))
+                    loss=torch.sum(torch.where(output_idx==target_adv, (1-lambda_t)*loss, lambda_t*loss))/(output.shape[-2]*output.shape[-1])
+                elif attack == 'cospgd':
+                    shape=[input_adv.shape[0], 21, input_adv.shape[2], input_adv.shape[3]]
+                    one_hot_target = torch.zeros(shape).cuda()
+                    target_adv = torch.clamp(target_adv, target_adv.min(), 20)
+                    one_hot_target = torch.nn.functional.one_hot(target_adv, num_classes=21).permute(0,3,1,2)
+                    eps=10**-8
+                    cossim=F.cosine_similarity(torch.sigmoid(output)+eps, one_hot_target+eps, dim=1, eps=10**-20)
+                    #loss = torch.sum(cossim.detach()*loss)/(output.shape[-2]*output.shape[-1])
+                    with torch.no_grad():
+                        loss *= cossim
+                        loss = loss.sum()
+                        loss /= output.shape[-2]*output.shape[-1]
+                input_adv.retain_grad()
+                loss = loss.mean()
+                loss.backward(retain_graph=True)
+                data_grad = input_adv.grad
+                input_adv = fgsm_attack(input_adv, epsilon, data_grad, clip_min, clip_max, alpha)
+
+
+            #print("input_clean: {}\t input_adv: {}\t input cat: {}".format(input_clean.shape, input_adv.shape, torch.cat((input_clean, input_clean), dim=0).shape))
+            input[int(len(input)/2):,:,:,:] = input_adv
+            #print("shape:{}".format(input.shape))
+            #input = torch.cat((input_clean, input_adv), dim=0)
         output, main_loss, aux_loss = model(input, target)
         if not args.multiprocessing_distributed:
             main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
         loss = main_loss + args.aux_weight * aux_loss
+        output=output.max(1)[1]
+
+        #output_adv, main_loss_adv, aux_loss_adv = model(input_adv, target_adv)
+        #if not args.multiprocessing_distributed:
+        #    main_loss_adv, aux_loss_adv = torch.mean(main_loss_adv), torch.mean(aux_loss_adv)
+        #loss += main_loss_adv + args.aux_weight * aux_loss_adv
 
         optimizer.zero_grad()
+        loss = loss.mean()
         loss.backward()
         optimizer.step()
+        main_loss = main_loss.mean()
+        aux_loss = aux_loss.mean()
+        loss = loss.mean()
 
         n = input.size(0)
         if args.multiprocessing_distributed:
