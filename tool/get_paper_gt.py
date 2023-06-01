@@ -15,12 +15,12 @@ from util import dataset, transform, config
 from util.util import AverageMeter, intersectionAndUnion, check_makedirs, colorize
 
 import matplotlib.pyplot as plt
-import os
 import math
 import matplotlib
 import scipy.signal as signal
 import scipy.stats as stats
 from pathlib import Path
+import glob
 
 from scipy import fftpack
 from tool import radialProfile
@@ -125,22 +125,19 @@ def main():
     
     cal_acc(test_data.data_list, ground_truth, args.classes, names)
 
-def cal_acc(data_list, freq_folder, classes, names):
-    across_images = []
-    first = True
-    #freq_folder = freq_folder.replace('_gpu/', '/')
-    #freq_folder = freq_folder.replace('/unet/', '/unet_11_binary_plots_full_2_correct/ground_truth/')
-    #from pathlib import Path
-    #freq_folder = Path(freq_folder)
-    #freq_folder = str(freq_folder.parent.parent.parent.parent)
-    #check_makedirs(freq_folder)
-    freq_folder = "/work/ws-tmp/sa058646-segment/semseg/runs/ground_truth_images"
-    for i, (image_path, target_path) in enumerate(data_list):
-        image_name = image_path.split('/')[-1].split('.')[0]        
-        target = cv2.imread(target_path, cv2.IMREAD_GRAYSCALE) 
-        #target *= 255
-        save_name = freq_folder + '/' + image_name + '.png'        
-        cv2.imwrite(save_name, target)
+def cal_acc(data_list, freq_folder, classes, names): 
+    save_path="/work/ws-tmp/sa058646-segment/semseg/runs/new_exp_slak/voc2012/unet_11_binary_plots_full_2_correct/paper_plots/paper_gt/"
+    ground_truth_path=glob.glob("/work/ws-tmp/sa058646-segment/semseg/runs/ground_truth_images/*.png")
+    
+    for gt_path in ground_truth_path:
+        image_name = os.path.basename(gt_path)
+        gt = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)         
+        for i in range(gt.shape[0]):
+            for j in range(gt.shape[1]):
+                if not gt[i][j]==0:
+                    gt[i][j]=255
+        save_name = save_path + '/' + image_name      
+        cv2.imwrite(save_name, gt)
 
 
 

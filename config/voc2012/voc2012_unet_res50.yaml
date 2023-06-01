@@ -6,7 +6,7 @@ DATA:
 
 TRAIN:
   arch: unet
-  backbone: convnext_tiny
+  backbone: resnet50
   optimizer: adamw
   pretrained: True
   layers: 50
@@ -30,7 +30,7 @@ TRAIN:
   batch_size_val: 8  # batch size for validation during training, memory and speed tradeoff
   base_lr: 0.0001
   epochs: 250
-  start_epoch: 225
+  start_epoch: 0
   power: 0.9
   momentum: 0.9
   weight_decay: 0.05
@@ -52,9 +52,9 @@ Distributed:
   Decom: True
   width_factor: 1.3
   kernel_size: [51, 49, 47, 13, 5]
-  trans_kernel: 17 #2
+  trans_kernel: 2
   backbone_kernel: 3
-  small_trans: 3 #0
+  small_trans: 0 #3
   small_conv: 0 #3
   use_convnext_backbone: False
   freq_upscale: False
@@ -72,13 +72,10 @@ TEST:
   index_start: 0  # evaluation start index in list
   index_step: 0  # evaluation step index in list, 0 means to end
   test_gpu: [0, 1]
-  epsilon: 0.03
-  alpha: 0.01
+  epsilon: 0.0
+  alpha: 0.15
   iterations: 1
-  attack: 'cospgd'
-  sigmoid: True
-  model_path: /work/ws-tmp/sa058646-segment/semseg/runs/new_exp_slak/voc2012/unet_extra/convnext_tiny_trans_kernel_17_small_trans_0_convnext_backbone_False_backbone_kernel_3_small_conv_0/model/train_epoch_250.pth
-  save_folder: /work/ws-tmp/sa058646-segment/semseg/runs/iccv_teaser/  # results save folder
+  model_path: /work/ws-tmp/sa058646-segment/semseg/runs/rebuttal/voc2012/unet_resnet_01/model/train_epoch_250.pth
+  save_folder: /work/ws-tmp/sa058646-segment/semseg/runs/rebuttal/voc2012/unet_resnet_01/val/ss  # results save folder
   colors_path: data/voc2012/voc2012_colors.txt  # path of dataset colors
   names_path: data/voc2012/voc2012_names.txt  # path of dataset category names
-

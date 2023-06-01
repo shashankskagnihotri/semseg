@@ -19,6 +19,7 @@ class PPM(nn.Module):
         self.features = nn.ModuleList(self.features)
 
     def forward(self, x):
+        #import ipdb;ipdb.set_trace()
         x_size = x.size()
         out = [x]
         for f in self.features:
@@ -61,13 +62,29 @@ class PSPNet(nn.Module):
         if use_ppm:
             self.ppm = PPM(fea_dim, int(fea_dim/len(bins)), bins)
             fea_dim *= 2
+        
         self.cls = nn.Sequential(
-            nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False, groups=1),
+            nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False, groups=512),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=dropout),
+            #ConvTranspose2d
             nn.Conv2d(512, classes, kernel_size=1)
         )
+
+        """
+        
+        self.cls=nn.Sequential()
+        self.cls.0 = nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False)
+        self.cls.1 = nn.BatchNorm2d(512)
+        self.cls.2 = nn.ReLU(inplace=True)
+        self.cls.3 = nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False)
+        self.cls.4 = nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False)
+        """
+        
+        
+        #self.cls2 = nn.Conv2d(512, classes, kernel_size=1)
+        
         if self.training:
             self.aux = nn.Sequential(
                 nn.Conv2d(1024, 256, kernel_size=3, padding=1, bias=False),
@@ -79,6 +96,8 @@ class PSPNet(nn.Module):
 
     def forward(self, x, y=None):
         x_size = x.size()
+        #import ipdb;ipdb.set_trace()
+        #feature_map = None
         assert (x_size[2]-1) % 8 == 0 and (x_size[3]-1) % 8 == 0
         h = int((x_size[2] - 1) / 8 * self.zoom_factor + 1)
         w = int((x_size[3] - 1) / 8 * self.zoom_factor + 1)
@@ -87,12 +106,17 @@ class PSPNet(nn.Module):
         x = self.layer1(x)
         x = self.layer2(x)
         x_tmp = self.layer3(x)
-        x = self.layer4(x_tmp)
+        x = self.layer4(x_tmp)        
         if self.use_ppm:
             x = self.ppm(x)
-        x = self.cls(x)
-        #print("\n\n\t\t\tINSIDE PSPNet x.shape: {}".format(x.shape))
-        #import ipdb;ipdb.set_trace()
+        #feature_map = self.cls1(x)
+        #x = self.cls2(feature_map)
+        #x=feature_map
+        #x=self.cls(x)
+        #x = self.cls(x)
+        feature_map = self.cls[0](x)
+        x = self.cls[4](self.cls[3](self.cls[2](self.cls[1](feature_map))))
+        print("\n\n\t\t\tINSIDE PSPNet x.shape: {}".format(x.shape))
         if self.zoom_factor != 1:
             x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=True)
 
@@ -105,7 +129,7 @@ class PSPNet(nn.Module):
             #return x.max(1)[1], main_loss, aux_loss
             return x, main_loss, aux_loss
         else:
-            return x
+            return x, feature_map
 
 
 if __name__ == '__main__':

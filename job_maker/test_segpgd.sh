@@ -13,15 +13,20 @@ base_lr="0.0001"
 #small_trans="3 5"
 #small_conv="5"
 save_path="runs/new_exp_slak/voc2012/unet_11"
+actual_save_path="runs/neurips/high_alpha_segpgd/voc2012/unet_11"
 #save_path="runs/freq_upsampling_correct/voc2012/unet"
 optimizers="adamw"
 criterion="cross_entropy"
-trans_kernel="2 7 11"
-use_convnext="False True"
-backbone_kernel="7 11"
-small_trans="3"
-small_conv="3"
-epsilon="20 40 100"
+#trans_kernel="2 7 11"
+trans_kernel="2"
+#use_convnext="False True"
+use_convnext="False"
+#backbone_kernel="7 11"
+backbone_kernel="3"
+small_trans="0"
+small_conv="0"
+#epsilon="3 5 10 20 40 100"
+epsilon="10 20 40 100"
 
 
 for epoch in $epochs
@@ -75,7 +80,7 @@ do
 		                    for eps in $epsilon
 							do
 								path="${save_path}/${net}_trans_kernel_${trans}_small_trans_${st}_convnext_backbone_${use_convx}_backbone_kernel_${bk}_small_conv_${small_conv}/model"
-		                    	folder="${save_path}/segpgd_attack/${net}_trans_kernel_${trans}_small_trans_${st}_convnext_backbone_${use_convx}_backbone_kernel_${bk}_small_conv_${small_conv}/val/ss/iterations_${eps}"
+		                    	folder="${actual_save_path}/correct_segpgd_attack/${net}_trans_kernel_${trans}_small_trans_${st}_convnext_backbone_${use_convx}_backbone_kernel_${bk}_small_conv_${small_conv}/val/ss/iterations_${eps}"
 								var=$(ls ${path}| sort -V | tail -n 1)
 								model_location="${path}/${var}"
 		                    	env

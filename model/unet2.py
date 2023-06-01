@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from collections import OrderedDict
 
 '''
 Append padding to keep concat size & input-output size
@@ -63,14 +64,22 @@ class UNet(nn.Module):
         self.dec3 = UpBlock(self.conv_dim*8, self.conv_dim*4, self.conv_dim*2)
         self.dec4 = UpBlock(self.conv_dim*4, self.conv_dim*2, self.conv_dim)
 
-        self.last = nn.Sequential(
-            nn.Conv2d(self.conv_dim*2, self.conv_dim, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(self.conv_dim),
-            nn.Conv2d(self.conv_dim, self.conv_dim, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(self.conv_dim),
-            nn.Conv2d(self.conv_dim, self.num_classes, kernel_size=1, stride=1))
+        #self.final = nn.Sequential(
+        #    nn.Conv2d(self.conv_dim*2, self.conv_dim, kernel_size=3, stride=1, padding=1),
+        #    nn.ReLU(),
+        #    nn.BatchNorm2d(self.conv_dim),
+        #    nn.Conv2d(self.conv_dim, self.conv_dim, kernel_size=3, stride=1, padding=1),
+        #    nn.ReLU(),
+        #    nn.BatchNorm2d(self.conv_dim),
+        #    )
+        self.last = nn.Sequential(OrderedDict([("conv1", nn.Conv2d(self.conv_dim*2, self.conv_dim, kernel_size=3, stride=1, padding=1)),
+                                ("relu1", nn.ReLU(),),
+                                ("norm1", nn.BatchNorm2d(self.conv_dim)),
+                                ("conv2",  nn.Conv2d(self.conv_dim, self.conv_dim, kernel_size=3, stride=1, padding=1)),
+                                ("relu2", nn.ReLU()),
+                                ("norm2",nn.BatchNorm2d(self.conv_dim)),
+                                ("out", nn.Conv2d(self.conv_dim, self.num_classes, kernel_size=1, stride=1))]))
+        #self.last.out = nn.Conv2d(self.conv_dim, self.num_classes, kernel_size=1, stride=1)
 
     def forward(self, x):
         enc1 = self.enc1(x) # 16
@@ -85,7 +94,8 @@ class UNet(nn.Module):
         dec3 = self.dec3(torch.cat([enc3, dec2], dim=1))
         dec4 = self.dec4(torch.cat([enc2, dec3], dim=1))
 
-        last = self.last(torch.cat([enc1, dec4], dim=1))
+        #last = self.final(torch.cat([enc1, dec4], dim=1))
+        last = self.last.norm2(self.last.relu2(self.last.conv2(self.last.norm1(self.last.relu1(self.last.conv1(torch.cat([enc1, dec4], dim=1)))))))
         assert x.size(-1) == last.size(-1), 'input size(W)-{} mismatches with output size(W)-{}' \
                                             .format(x.size(-1), output.size(-1))
         assert x.size(-2) == last.size(-2), 'input size(H)-{} mismatches with output size(H)-{}' \

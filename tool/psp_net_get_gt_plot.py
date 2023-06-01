@@ -99,8 +99,7 @@ def main():
     color_folder = os.path.join(args.save_folder, 'color')
     freq_folder = os.path.join(args.save_folder, 'frequency')    
     feature_folder = os.path.join(args.save_folder, 'feature_maps')
-    ground_truth = os.path.join(args.save_folder, 'ground_truth')
-    check_makedirs(ground_truth)
+    check_makedirs(feature_folder)
 
     test_transform = transform.Compose([transform.ToTensor()])
     test_data = dataset.SemData(split=args.split, data_root=args.data_root, data_list=args.test_list, transform=test_transform)
@@ -123,24 +122,72 @@ def main():
     colors = np.loadtxt(args.colors_path).astype('uint8')
     names = [line.rstrip('\n') for line in open(args.names_path)]
     
-    cal_acc(test_data.data_list, ground_truth, args.classes, names)
+    cal_acc(test_data.data_list, freq_folder, args.classes, names)
 
 def cal_acc(data_list, freq_folder, classes, names):
     across_images = []
     first = True
     #freq_folder = freq_folder.replace('_gpu/', '/')
-    #freq_folder = freq_folder.replace('/unet/', '/unet_11_binary_plots_full_2_correct/ground_truth/')
-    #from pathlib import Path
-    #freq_folder = Path(freq_folder)
-    #freq_folder = str(freq_folder.parent.parent.parent.parent)
-    #check_makedirs(freq_folder)
-    freq_folder = "/work/ws-tmp/sa058646-segment/semseg/runs/ground_truth_images"
+    #freq_folder = freq_folder.replace('/unet/', '/pspnet_plots_full_2_correct2/')
+    freq_folder = "/work/ws-tmp/sa058646-segment/semseg/runs/pspnet_ground_truth/"
+    check_makedirs(freq_folder)
     for i, (image_path, target_path) in enumerate(data_list):
         image_name = image_path.split('/')[-1].split('.')[0]        
         target = cv2.imread(target_path, cv2.IMREAD_GRAYSCALE) 
-        #target *= 255
-        save_name = freq_folder + '/' + image_name + '.png'        
-        cv2.imwrite(save_name, target)
+        #import ipdb;ipdb.set_trace()    
+        #image = np.resize(target, (60,60))        
+        #image = cv2.resize(target, (256, 256), interpolation=cv2.INTER_CUBIC)
+        if target.shape[0]<473:
+            target.resize((473,target.shape[1]))
+        if target.shape[1]<473:
+            target.resize((target.shape[0], 473))
+        image = target[target.shape[0]-473:,target.shape[1]-473:]        
+        #print(image.shape)
+        #if image.shape[0]!=256:
+        #    import ipdb;ipdb.set_trace()    
+        
+        #import ipdb;ipdb.set_trace()
+        F1 = np.fft.fft2(image)
+        #F2 = fftpack.fftshift(F1)
+        amp = np.abs(F1)**2
+        amp = np.expand_dims(amp, axis=0)
+        if first:
+            across_images = amp
+            first=False
+        else:            
+            across_images = np.vstack((across_images, amp))            
+    amplitude = np.average(across_images, axis=0)
+    npix = amplitude.shape[0]
+    kfreq = np.fft.fftfreq(npix) *npix
+
+    kfreq2D = np.meshgrid(kfreq, kfreq)
+    knrm = np.sqrt(kfreq2D[0]**2 + kfreq2D[1]**2)
+    knrm = knrm.flatten()
+    fourier_amplitudes = amplitude.flatten()
+
+    kbins = np.arange(0.5, npix//2+1, 1.)
+    kvals = 0.5 * (kbins[1:] + kbins[:-1])
+    Abins, _, _ = stats.binned_statistic(knrm, fourier_amplitudes,
+                                         statistic = "mean",
+                                         bins = kbins)
+    Abins *= np.pi * (kbins[1:]**2 - kbins[:-1]**2)
+
+    #save_name = Path(freq_folder).parent.parent.parent.name + '.pt'
+    save_name = "ground_truth.pt"
+    figure_name = "ground_truth.png"
+    #save_folder = Path(freq_folder) #.parent.parent.parent.parent
+    save_folder = freq_folder
+    file_name = os.path.join(save_folder, save_name)
+    plot_name = os.path.join(save_folder, figure_name)
+    #import ipdb;ipdb.set_trace()
+    torch.save(torch.tensor([kvals, Abins], device='cpu'), file_name)
+
+    plt.loglog(kvals, Abins)
+    plt.xlabel("$k$")
+    plt.ylabel("$P(k)$")
+    plt.tight_layout()
+    plt.title("Ground truth")
+    plt.savefig(plot_name, dpi = 500, bbox_inches = "tight")
 
 
 

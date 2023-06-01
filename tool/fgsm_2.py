@@ -12,6 +12,10 @@ import torch.nn.parallel
 import torch.utils.data
 import torchvision.transforms as transforms
 
+import sys
+file_dir = os.path.dirname("/work/ws-tmp/sa058646-segment/semseg/util")
+sys.path.append(file_dir)
+
 from util import dataset, transform, config
 from util.util import AverageMeter, intersectionAndUnion, check_makedirs, colorize
 
@@ -23,6 +27,9 @@ import scipy.signal as signal
 import scipy.stats as stats
 from pathlib import Path
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:24"
+torch.cuda.empty_cache()
+
 cv2.ocl.setUseOpenCL(False)
 maps = 0
 outputs = []
@@ -32,7 +39,8 @@ input_folder, target_folder, fgsm_folder = "", "", ""
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
+    #parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='/work/ws-tmp/sa058646-segment/semseg/config/voc2012/voc2012_unet_res50.yaml', help='config file')
     parser.add_argument('--testing', '-t', type=bool)
     parser.add_argument('opts', help='see config/voc2012/voc2012_unet_convnexttiny_250.yaml', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -76,7 +84,7 @@ def check(args):
                         args.mask_h <= 2 * ((args.train_h - 1) // (8 * args.shrink_factor) + 1) - 1)
                 assert (args.mask_w % 2 == 1) and (args.mask_w >= 3) and (
                         args.mask_w <= 2 * ((args.train_h - 1) // (8 * args.shrink_factor) + 1) - 1)
-    elif args.arch == 'unet':
+    elif args.arch == 'unet' or args.arch == 'unet2':
         print("::::::::::::::   Using UNet   ::::::::::::::")
     else:
         raise Exception('architecture not supported yet'.format(args.arch))
@@ -229,13 +237,13 @@ def main():
         cal_acc(test_data.data_list, gray_folder, args.classes, names)
 
 # FGSM attack code
-def fgsm_attack(image, epsilon, data_grad):
+def fgsm_attack(image, epsilon, data_grad, clip_min, clip_max):
     # Collect the element-wise sign of the data gradient
     sign_data_grad = data_grad.sign()
     # Create the perturbed image by adjusting each pixel of the input image
     perturbed_image = image + epsilon*sign_data_grad
     # Adding clipping to maintain [0,1] range
-    #perturbed_image = torch.clamp(perturbed_image, 0, 1)
+    perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
     # Return the perturbed image
     return perturbed_image
 
@@ -243,7 +251,7 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
                 image_name=None, feature_folder=None):    
     global maps, output_before_softmax, args, outputs, input_folder, target_folder, fgsm_folder
     storing_image = np.uint8(image.copy())
-    storing_target = np.uint8(target.copy())*255
+    storing_target = np.uint8(target.copy()) #*255
     storing_image = cv2.cvtColor(storing_image, cv2.COLOR_RGB2BGR)
     input_name = input_folder + '/' + image_name + '_crop_' + str(crop_counter) + '.png'
     target_name = target_folder + '/' + image_name + '_crop_' + str(crop_counter) + '.png'
@@ -254,6 +262,8 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
     target = torch.from_numpy(target.astype(np.int64))
     
     #print('target in net before unsqueeze: ', target.shape)
+
+    orig_min, orig_max = input.min(), input.max()
     
     epsilon = args.epsilon
     if std is None:
@@ -265,6 +275,9 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
     input = input.unsqueeze(0).cuda()
     target = target.unsqueeze(0).cuda()
 
+    #clip_min, clip_max = input.min()-epsilon, input.max()+epsilon
+    clip_min, clip_max = input.min(), input.max()
+
     #print('target in net after unsqueeze: ', target.shape)
 
     #import ipdb;ipdb.set_trace()
@@ -272,7 +285,7 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
     if flip:
         input = torch.cat([input, input.flip(3)], 0)
     #with torch.no_grad():
-    if args.arch=='unet':
+    if args.arch=='unet' or args.arch=='unet2':
         maps = model(input)            
         output = model.module.last.out(maps)            
         maps = maps.detach().cpu()#.numpy()
@@ -285,10 +298,18 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
     loss.backward()
     data_grad = input.grad
 
-    perturbed_input = fgsm_attack(input, epsilon, data_grad)
+    #print('mean: {}\t min: {}\t max: {}'.format(input.mean(), input.min(), input.max()))
+    #import ipdb;ipdb.set_trace()
 
-    if args.arch=='unet':
-        maps = model(perturbed_input)            
+    perturbed_input = fgsm_attack(input, epsilon, data_grad, clip_min, clip_max)
+
+    #print('PERTURBED mean: {}\t min: {}\t max: {}'.format(perturbed_input.mean(), perturbed_input.min(), perturbed_input.max()))
+    #import ipdb;ipdb.set_trace()
+
+    if args.arch=='unet' or args.arch=='unet2':
+        maps = model(perturbed_input)
+        #import ipdb;ipdb.set_trace()            
+        print("\n\n\n\nmaps: {}\n\n\n\n", maps.shape)
         output = model.module.last.out(maps)            
         maps = maps.detach().cpu()#.numpy()
     else:
@@ -298,6 +319,7 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
     for t, m, s in zip(storing_perturbed, mean, std):
         t.mul_(s).add_(m)
     #storing_perturbed = transforms.ToPILImage()()
+    storing_perturbed = torch.clamp(storing_perturbed, orig_min, orig_max)
     storing_perturbed = np.uint8(storing_perturbed.numpy().transpose(1,2,0))
     #storing_perturbed = np.uint8(storing_perturbed[:,:,:3])
     #storing_perturbed = np.uint8(storing_perturbed)
@@ -336,7 +358,7 @@ def scale_process(model, image, target, classes, crop_h, crop_w, h, w, mean,
     pad_w_half = int(pad_w / 2)
     if pad_h > 0 or pad_w > 0:
         image = cv2.copyMakeBorder(image, pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=mean)
-        target = cv2.copyMakeBorder(target, pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=int(target.mean()))
+        target = cv2.copyMakeBorder(target, pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=int(target.min()))
     
     #print('target in scale after make border: ', target.shape)
 
@@ -360,11 +382,7 @@ def scale_process(model, image, target, classes, crop_h, crop_w, h, w, mean,
             target_crop = target[s_h:e_h, s_w:e_w].copy()
             count_crop[s_h:e_h, s_w:e_w] += 1
             crop_counter +=1
-            prediction_crop[s_h:e_h, s_w:e_w, :] += net_process(model, image_crop, 
-                                                        target_crop, crop_counter, 
-                                                        mean, std, 
-                                                        image_name=image_name, 
-                                                        feature_folder=feature_folder)
+            prediction_crop[s_h:e_h, s_w:e_w, :] += net_process(model, image_crop, target_crop, crop_counter, mean, std, image_name=image_name, feature_folder=feature_folder)
     prediction_crop /= np.expand_dims(count_crop, 2)
     prediction_crop = prediction_crop[pad_h_half:pad_h_half+ori_h, pad_w_half:pad_w_half+ori_w]
     prediction = cv2.resize(prediction_crop, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -399,7 +417,7 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h,
             else:
                 new_h = round(long_size/float(w)*h)
             image_scale = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            target_scale = cv2.resize(target, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            target_scale = cv2.resize(target, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
             prediction += scale_process(model, image_scale, target_scale, classes, 
                                         crop_h, crop_w, h, w, mean, std, 
                                         image_name=image_name, 

@@ -277,7 +277,7 @@ def train(train_loader, model, optimizer, epoch):
         input = input.cuda(non_blocking=True)                      
         #target = modify_target(target)       
         target = target.cuda(non_blocking=True)   
-        if args.arch == 'unet':
+        if args.arch == 'unet' or args.arch =='unet2':
             output = model(input)
             #import ipdb;ipdb.set_trace()
             main_loss = model.module.criterion(output, target)
@@ -396,6 +396,7 @@ def validate(val_loader, model, criterion):
         intersection, union, target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
         if args.multiprocessing_distributed:
             dist.all_reduce(intersection), dist.all_reduce(union), dist.all_reduce(target)
+        #import ipdb;ipdb.set_trace()
         intersection, union, target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy()
         intersection_meter.update(intersection), union_meter.update(union), target_meter.update(target)
 

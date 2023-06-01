@@ -7,7 +7,7 @@
 
 import sys
 # Add WHERE_YOU_CLONED_CUTLASS/examples/19_large_depthwise_conv2d_torch_extension into your PYTHONPATH by the following commands:
-sys.path.append('/work/ws-tmp/sa058646-segment2/SLaK/cutlass/examples/19_large_depthwise_conv2d_torch_extension')
+sys.path.append('/work/ws-tmp/sa058646-segment/SLaK/cutlass/examples/19_large_depthwise_conv2d_torch_extension')
 
 import torch
 import torch.nn as nn
@@ -152,7 +152,7 @@ class Block(nn.Module):
 
     def forward(self, x):
         input = x
-        x = self.large_kernel(x)
+        x = self.large_kernel(x.contiguous())
         x = x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
         x = self.norm(x)
         x = self.pwconv1(x)

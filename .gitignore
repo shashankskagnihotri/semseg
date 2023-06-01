@@ -81,5 +81,7 @@ dataset/
 *.ninja_log
 *.ninja
 #*.yaml
-slurm*
+slurm/*
 initmodel
+*.sh
+runs/*

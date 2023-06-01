@@ -78,7 +78,7 @@ def check(args):
                         args.mask_h <= 2 * ((args.train_h - 1) // (8 * args.shrink_factor) + 1) - 1)
                 assert (args.mask_w % 2 == 1) and (args.mask_w >= 3) and (
                         args.mask_w <= 2 * ((args.train_h - 1) // (8 * args.shrink_factor) + 1) - 1)
-    elif args.arch == 'unet':
+    elif args.arch == 'unet' or args.arch == 'unet2':
         assert (args.train_h) % 8 == 0 and (args.train_w) % 8 == 0
         print("::::::::::::::::::   Using UNet   ::::::::::::::::::")
     else:
@@ -251,10 +251,15 @@ def main_worker(gpu, ngpus_per_node, argss):
     for module in modules_ori:
         if args.arch=='unet' and args.backbone not in backbones:
             params_list.append(dict(params=module.parameters(), lr=args.base_lr*10))
+        elif args.arch=='unet2':
+            params_list.append(dict(params=module.parameters(), lr=args.base_lr))
         else:
             params_list.append(dict(params=module.parameters(), lr=args.base_lr))
     for module in modules_new:
-        params_list.append(dict(params=module.parameters(), lr=args.base_lr * 10))
+        if args.arch=='unet2':
+            params_list.append(dict(params=module.parameters(), lr=args.base_lr))
+        else:
+            params_list.append(dict(params=module.parameters(), lr=args.base_lr * 10))
     args.index_split = 5
     if hasattr(args, 'optimizer') and args.optimizer == 'adam':
         optimizer = torch.optim.Adam(params_list, lr=args.base_lr,                                     
@@ -284,7 +289,7 @@ def main_worker(gpu, ngpus_per_node, argss):
         args.batch_size = int(args.batch_size / ngpus_per_node)
         args.batch_size_val = int(args.batch_size_val / ngpus_per_node)
         args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu], find_unused_parameters=True)
         #model = torch.nn.parallel.DistributedDataParallel(model.to(args.device), find_unused_parameters=True)#, device_ids=[gpu])
     else:
         model = torch.nn.DataParallel(model)
@@ -438,10 +443,12 @@ def train(train_loader, model, optimizer, epoch, scheduler=None):
         #target = target.cuda(non_blocking=True)
         input = input.to(args.device)
         target = target.to(args.device)
-        if args.arch=='unet':            
+        if args.arch=='unet' or args.arch=='unet2':            
             output = model(input)
+            #output = model.module.last.out(output)
             #import ipdb;ipdb.set_trace()
-            output = model.module.last.out(output)
+            if not 'SLaK' in args.backbone:
+                output = model.module.last.out(output)
             loss = model.module.criterion(output, target)
             
             #print("intput: ", torch.mean(input))

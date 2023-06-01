@@ -1,699 +1,930 @@
-from base import BaseModel
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from itertools import chain
-from base import BaseModel
-from utils.helpers import initialize_weights, set_trainable
-from itertools import chain
-from model import resnet_3
-from model import resnet_2
-from model import inverse_resnet
-from timm.models.layers import trunc_normal_, DropPath
-from timm.models.registry import register_model
-from model import convnext, SLaK
-import torchvision.models
-from collections import OrderedDict
-import math
-
-
-
-def x2conv(in_channels, out_channels, inner_channels=None):
-    inner_channels = out_channels // 2 if inner_channels is None else inner_channels
-    down_conv = nn.Sequential(
-        nn.Conv2d(in_channels, inner_channels, kernel_size=3, padding=1, bias=False),
-        nn.BatchNorm2d(inner_channels),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(inner_channels, out_channels, kernel_size=3, padding=1, bias=False),
-        nn.BatchNorm2d(out_channels),
-        nn.ReLU(inplace=True))
-    return down_conv
-
-def backbone_conv(in_channels, out_channels, inner_channels=None):
-    inner_channels = out_channels // 2 if inner_channels is None else inner_channels
-    down_conv = nn.Sequential(
-        nn.Conv2d(in_channels*2, inner_channels, kernel_size=3, padding=1, bias=False),
-        nn.BatchNorm2d(inner_channels),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(inner_channels, out_channels, kernel_size=3, padding=1, bias=False),
-        nn.BatchNorm2d(out_channels),
-        nn.ReLU(inplace=True))
-    return down_conv
-
-def backbone_convnext(in_channels, out_channels, kernel_size=7, inner_channels=None, small_conv=None):
-    inner_channels = out_channels // 2 if inner_channels is None else inner_channels
-    down_conv = nn.Sequential(
-        nn.Conv2d(in_channels*2, inner_channels, kernel_size=kernel_size, 
-                padding=(kernel_size-1)//2, bias=False, 
-                groups=math.gcd(in_channels*2, inner_channels)) \
-                if small_conv==0 else convolution(in_channels, out_channels, kernel_size, inner_channels, small_conv),
-        permutation_one(),
-        convnext.LayerNorm(inner_channels, eps=1e-6),
-        nn.Linear(inner_channels, inner_channels*4),
-        nn.GELU(),
-        nn.Linear(inner_channels*4, out_channels),
-        permutation_two()
-        )
-    return down_conv
-
-def convTrans2d(in_planes, out_planes, kernel_size=2, stride=2, padding=0):
-    """convtranspose 2d"""
-    return nn.ConvTranspose2d(in_planes, out_planes, kernel_size=kernel_size, 
-                                stride=stride, padding=padding, bias=False)
-
-class permutation_one(nn.Module):
-    def __init__(self):
-        super(permutation_one, self).__init__()
-    def forward(self, x):
-        return x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
-
-class permutation_two(nn.Module):
-    def __init__(self):
-        super(permutation_two, self).__init__()
-    def forward(self, x):
-        return x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
-
-class convolution(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, inner_channels, small_conv):
-        super(convolution, self).__init__()
-        self.large_convolution = nn.Conv2d(in_channels*2, inner_channels, kernel_size=kernel_size, 
-                                    padding=(kernel_size-1)//2, bias=False, 
-                                    groups=math.gcd(in_channels*2, inner_channels))        
-        self.small_convolution = nn.Conv2d(in_channels*2, inner_channels, kernel_size=small_conv, 
-                                    padding=(small_conv-1)//2, bias=False, 
-                                    groups=math.gcd(in_channels*2, inner_channels))
-    def forward(self, x):
-        return self.large_convolution(x) + self.small_convolution(x)        
-
-class encoder(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(encoder, self).__init__()
-        self.down_conv = x2conv(in_channels, out_channels)
-        self.pool = nn.MaxPool2d(kernel_size=2, ceil_mode=True)
-
-    def forward(self, x):
-        x = self.down_conv(x)
-        x = self.pool(x)
-        return x
-
-class decoder(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(decoder, self).__init__()
-        self.up = nn.ConvTranspose2d(in_channels, in_channels//2, kernel_size=2, stride=2)
-        self.up_conv = x2conv(in_channels, out_channels)
-
-    def forward(self, x_copy, x, interpolate=True):
-        x = self.up(x)
-
-        if (x.size(2) != x_copy.size(2)) or (x.size(3) != x_copy.size(3)):
-            if interpolate:
-                # Iterpolating instead of padding
-                x = F.interpolate(x, size=(x_copy.size(2), x_copy.size(3)),
-                                mode="bilinear", align_corners=True)
-            else:
-                # Padding in case the incomping volumes are of different sizes
-                diffY = x_copy.size()[2] - x.size()[2]
-                diffX = x_copy.size()[3] - x.size()[3]
-                x = F.pad(x, (diffX // 2, diffX - diffX // 2,
-                                diffY // 2, diffY - diffY // 2))
-
-        # Concatenate
-        x = torch.cat([x_copy, x], dim=1)
-        x = self.up_conv(x)
-        return x
-
-
-class decoder_resnet(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=2, 
-                backbone_kernel=7, use_convnext_backbone=False, 
-                small_trans=None, small_conv=None):
-        super(decoder_resnet, self).__init__()
-        pos1 = int(in_channels*2)
-        pos2 = int(in_channels)
-        padding = 0 
-        output_padding = 0 if kernel_size==2 else 1  
-        if kernel_size != 2:
-            padding = (kernel_size-1)//2
-
-        #groups=pos2 if (kernel_size>2 and pos1%pos2==0) else 1         
-        groups=math.gcd(pos1, pos2) if kernel_size>2 else 1 
-        self.up = nn.ConvTranspose2d(pos1, pos2, kernel_size=kernel_size, 
-                                    stride=2, padding=padding, groups=groups, 
-                                    output_padding=output_padding)
-        self.up_conv = backbone_convnext(int(in_channels), out_channels, 
-                                            kernel_size=backbone_kernel, small_conv=small_conv) \
-                        if use_convnext_backbone else backbone_conv(int(in_channels), out_channels)
-        self.small_trans_kernel = nn.ConvTranspose2d(pos1, pos2, kernel_size=small_trans, 
-                                    stride=2, padding=(small_trans-1)//2, groups=groups, 
-                                    output_padding=output_padding) if small_trans!=0 else None
-
-    def forward(self, x_copy, x, interpolate=True):       
-        # Concatenate
-        #x1 = self.up(x)
-        #x = (x1 + self.small_trans_kernel(x)) if self.small_trans_kernel != None else x
-        #x = self.up(x) + (self.small_trans_kernel(x) if self.small_trans_kernel != None else None)
-        if self.small_trans_kernel != None:
-            x = self.up(x) + self.small_trans_kernel(x)
-        else:
-            x = self.up(x)
-        x = torch.cat([x_copy, x], dim=1)
-        x = self.up_conv(x)        
-        return x
-
-
-class UNet(BaseModel):
-    def __init__(self, num_classes, in_channels=3, criterion=nn.CrossEntropyLoss(ignore_index=255),
-                 freeze_bn=False, **_):
-        super(UNet, self).__init__()
-
-        self.criterion=criterion
-        self.start_conv = x2conv(in_channels, 64)
-        self.down1 = encoder(64, 128)
-        self.down2 = encoder(128, 256)
-        self.down3 = encoder(256, 512)
-        self.down4 = encoder(512, 1024)
-
-        self.middle_conv = x2conv(1024, 1024)
-
-        self.up1 = decoder(1024, 512)
-        self.up2 = decoder(512, 256)
-        self.up3 = decoder(256, 128)
-        self.up4 = decoder(128, 64)
-        self.final_conv = nn.Conv2d(64, num_classes, kernel_size=1)
-        self._initialize_weights()
-
-        if freeze_bn:
-            self.freeze_bn()
-
-    def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight)
-                if module.bias is not None:
-                    module.bias.data.zero_()
-            elif isinstance(module, nn.BatchNorm2d):
-                module.weight.data.fill_(1)
-                module.bias.data.zero_()
-
-    def forward(self, x):
-        x1 = self.start_conv(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x = self.middle_conv(self.down4(x4))
-
-        x = self.up1(x4, x)
-        x = self.up2(x3, x)
-        x = self.up3(x2, x)
-        x = self.up4(x1, x)
-        self.feature_map = torch.clone(x)
-
-        x = self.final_conv(x)
-        return x, self.feature_map
-
-    def get_backbone_params(self):
-        # There is no backbone for unet, all the parameters are trained from scratch
-        return []
-
-    def get_decoder_params(self):
-        return self.parameters()
-
-    def freeze_bn(self):
-        for module in self.modules():
-            if isinstance(module, nn.BatchNorm2d): module.eval()
-
-
-
-
-"""
--> Unet with a resnet backbone
-"""
-
-class UNetResnet(BaseModel):    
-    def __init__(self, num_classes, in_channels=3, backbone='resnet50', 
-                pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255), 
-                freeze_bn=False, trans_kernel=[2, 2, 2], backbone_kernel=[7, 7, 7], 
-                use_convnext_backbone=False, small_trans=None, small_conv=None, freeze_backbone=False, **_):
-        super(UNetResnet, self).__init__()
-        """
-        #############    AWAITING UPGRADE     #############
-
-        from torchvision.prototype import models as PM
-        if backbone == 'resnet18':
-            weights=PM.ResNet18_Weights.DEFAULT
-        elif backbone == 'resnet34':
-            weights=PM.ResNet34_Weights.DEFAULT
-        elif backbone == 'resnet101':
-            weights=PM.ResNet101_Weights.DEFAULT
-        elif backbone == 'resnet152':
-            weights=PM.ResNet152_Weights.DEFAULT
-        else:
-            weights=PM.ResNet50_Weights.DEFAULT
-        model = getattr(PM, backbone)(weights=weights)
-        """
-        model = getattr(torchvision.models, backbone)(pretrained=pretrained)
-        base_width = model.fc.in_features
-        global decoder
-        #decoder_model = getattr(inverse_resnet, backbone)(pretrained=False, 
-        #                        width_per_group = base_width)
-        #model = getattr(resnet_2, backbone)(pretrained, norm_layer=nn.BatchNorm2d)
-
-        self.criterion = criterion
-        self.initial = list(model.children())[:4]
-        if in_channels != 3:
-            self.initial[0] = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.initial = nn.Sequential(*self.initial)
-
-        # encoder
-        self.layer1 = model.layer1
-        self.layer2 = model.layer2
-        self.layer3 = model.layer3
-        self.layer4 = model.layer4
-
-        #self.middle = x2conv(base_width, base_width)
-
-        # decoder   
-        #self.decoder1 = decoder(int(base_width), int(base_width/2))
-        self.decoder1 = x2conv(int(base_width), int(base_width))
-        #self.decoder1 = decoder(1024, 512)
-        self.decoder2 = decoder_resnet(int(base_width/2), int(base_width/2), 
-                                        kernel_size=trans_kernel[0], small_trans=small_trans, 
-                                        backbone_kernel=backbone_kernel[0], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        self.decoder3 = decoder_resnet(int(base_width/4), int(base_width/4), 
-                                        kernel_size=trans_kernel[1], small_trans=small_trans, 
-                                        backbone_kernel=backbone_kernel[1], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        self.decoder4 = decoder_resnet(int(base_width/8), int(base_width/8), 
-                                        kernel_size=trans_kernel[2], small_trans=small_trans, 
-                                        backbone_kernel=backbone_kernel[2], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        #self.decoder4 = decoder(int(base_width/16), int(base_width/32))
-        self.last = nn.Sequential(OrderedDict([("up", nn.ConvTranspose2d(int(base_width/8), 
-                                            int(base_width/32), 
-                                            kernel_size=1, stride=1)),
-                                ("conv", nn.Conv2d(int(base_width/16), 
-                                int(base_width/32), kernel_size=1)),
-                                ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/32)))),
-                                ("lastup", nn.ConvTranspose2d(int(base_width/32),
-                                    int(base_width/32), kernel_size=4, stride=4)),
-                                ("out", nn.Conv2d(int(base_width/32), 
-                                num_classes, kernel_size=1))]))
-        """
-        self.decoder1 = decoder_model.layer1
-        self.upconv1 = convTrans2d(int(base_width/4), int(base_width/2), kernel_size=2, stride=2)
-        self.decoder2 = decoder_model.layer2
-        self.upconv2 = convTrans2d(int(base_width/8), int(base_width/4), kernel_size=4, stride=4)
-        self.decoder3 = decoder_model.layer3
-        self.upconv3 = convTrans2d(int(base_width/16), int(base_width/8), kernel_size=4, stride=4)
-        self.decoder4 = decoder_model.layer4
-        self.upconv4 = convTrans2d(int(base_width/32), int(base_width/32), kernel_size=2, stride=2)
-        self.last = nn.Sequential(nn.Conv2d(int(base_width/16), int(base_width/32), kernel_size=1, 
-                                            stride=1, padding=0),
-                                nn.BatchNorm2d(int(base_width/32)), nn.ReLU(inplace=True),                                
-                                convTrans2d(int(base_width/32), 
-                                            int(base_width/32), 
-                                            #num_classes,
-                                            kernel_size=4, stride=4),
-                                nn.Conv2d(int(base_width/32), num_classes, kernel_size=1, 
-                                        stride=1, padding=0))
-        """
-
-        if pretrained:
-            print(":::::::::>>>>>>>       INITIALIZING ONLY THE DECODER")
-            decoder = [self.decoder1, self.decoder2, self.decoder3,
-                        self.decoder4, self.last]#, self.middle]
-            for dec in decoder:
-                initialize_weights(dec)
-        else:
-            print(":::::::::>>>>>>>       INITIALIZING THE WHOLE ARCHITECTURE")
-            initialize_weights(self)
-
-        if freeze_bn:
-            self.freeze_bn()
-        if freeze_backbone: 
-            set_trainable([self.initial, self.layer1, self.layer2, self.layer3, self.layer4], False)
-
-    def forward(self, x):
-        # encoding
-        x0 = self.initial(x)
-        x1 = self.layer1(x0)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-        #x5 = self.middle(x4)
-
-        #decoding
-        #import ipdb;ipdb.set_trace()
-        x = self.decoder1(x4)        
-        #x = self.upconv1(x)
-        
-        #x = torch.cat([x3, x], dim=1)
-
-        x = self.decoder2(x3, x)
-        #x = self.upconv2(x)
-        
-        #import ipdb;ipdb.set_trace()
-        #x = torch.cat([x2, x], dim=1)
-
-        x = self.decoder3(x2, x)
-        #x = self.upconv3(x)
-        
-        #x = torch.cat([x1, x], dim=1)
-
-        x = self.decoder4(x1, x)
-        #x = self.upconv4(x)
-
-        x = self.last.up(x)        
-        x = torch.cat([x0, x], dim=1)
-        x = self.last.norm(self.last.conv(x))
-        x = self.last.lastup(x)
-        #self.feature_map = torch.clone(x)
-        x = self.last.out(x)
-
-        """
-        H, W = x.size(2), x.size(3)
-        x0 = self.initial(x)
-        x1 = self.layer1(x0)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-        
-        x = self.upconv1(self.conv1(x4))
-        x = F.interpolate(x, size=(x3.size(2), x3.size(3)), mode="bilinear", align_corners=True)
-        x = torch.cat([x, x3], dim=1)
-        x = self.upconv2(self.conv2(x))
-
-        x = F.interpolate(x, size=(x2.size(2), x2.size(3)), mode="bilinear", align_corners=True)
-        x = torch.cat([x, x2], dim=1)
-        x = self.upconv3(self.conv3(x))
-
-        x = F.interpolate(x, size=(x1.size(2), x1.size(3)), mode="bilinear", align_corners=True)
-        x = torch.cat([x, x1], dim=1)
-
-        x = self.upconv4(self.conv4(x))
-
-        x = self.upconv5(self.conv5(x))
-
-        # if the input is not divisible by the output stride
-        if x.size(2) != H or x.size(3) != W:
-            x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=True)
-
-        x = self.conv7(self.conv6(x))
-        """
-
-        return x, self.feature_map
-
-    def get_backbone_params(self):
-        return chain(self.initial.parameters(), self.layer1.parameters(), self.layer2.parameters(), 
-                    self.layer3.parameters(), self.layer4.parameters())
-
-    def get_decoder_params(self):
-        return chain(self.conv1.parameters(), self.upconv1.parameters(), self.conv2.parameters(), self.upconv2.parameters(),
-                    self.conv3.parameters(), self.upconv3.parameters(), self.conv4.parameters(), self.upconv4.parameters(),
-                    self.conv5.parameters(), self.upconv5.parameters(), self.conv6.parameters(), self.conv7.parameters())
-
-    def freeze_bn(self):
-        for module in self.modules():
-            if isinstance(module, nn.BatchNorm2d): module.eval()
-
-
-"""
--> Unet with a ConvNext backbone
-    ConvNeXt
-        A PyTorch impl of : `A ConvNet for the 2020s`  -
-          https://arxiv.org/pdf/2201.03545.pdf
-"""
-
-class UNetConvNeXt(BaseModel):
-    def __init__(self, num_classes, in_channels=3, backbone='convnext_tiny', 
-                pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
-                freeze_bn=False, trans_kernel=[2, 2, 2], backbone_kernel=[7, 7, 7], 
-                use_convnext_backbone=False, small_trans=None, small_conv=None, freeze_backbone=False,**_):
-        super(UNetConvNeXt, self).__init__()
-        
-        #self.feature_map = torch.zeros([16, 96, 64, 64])
-        self.criterion = criterion
-        model = getattr(convnext, backbone)(pretrained=pretrained)
-        base_width = model.head.in_features
-
-        #self.initial = list(model.children())[:1]
-        self.initial = list(model.downsample_layers[0])
-        #TODO: get only the head here and modify it similar to resnet50
-        
-        if in_channels != 3:
-            self.initial[0] = nn.Conv2d(in_channels, 96, kernel_size=4, stride=4, padding=0, bias=False)
-        self.initial = nn.Sequential(*self.initial)
-
-        # encoder
-        self.layer1 = model.stages[0]
-        self.layer2 = nn.Sequential(model.downsample_layers[1], model.stages[1])
-        self.layer3 = nn.Sequential(model.downsample_layers[2], model.stages[2])
-        self.layer4 = nn.Sequential(model.downsample_layers[3], model.stages[3])
-
-        # decoder 
-        """
-        #TODO: modify it as per ConvNeXt dimensions
-        """
-        self.decoder1 = x2conv(int(base_width), int(base_width))
-        #self.decoder1 = decoder(1024, 512)
-        self.decoder2 = decoder_resnet(int(base_width/2), int(base_width/2), 
-                                        kernel_size=trans_kernel[0], small_trans=small_trans,
-                                        backbone_kernel=backbone_kernel[0], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        self.decoder3 = decoder_resnet(int(base_width/4), int(base_width/4), 
-                                        kernel_size=trans_kernel[1], small_trans=small_trans, 
-                                        backbone_kernel=backbone_kernel[1], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        self.decoder4 = decoder_resnet(int(base_width/8), int(base_width/8), 
-                                        kernel_size=trans_kernel[2], small_trans=small_trans, 
-                                        backbone_kernel=backbone_kernel[2], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        #self.decoder4 = decoder(int(base_width/16), int(base_width/32))
-        self.last = nn.Sequential(OrderedDict([
-                                ("conv", nn.Conv2d(int(base_width/4), 
-                                int(base_width/8), kernel_size=1)),
-                                ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/8)))),
-                                ("lastup", nn.ConvTranspose2d(int(base_width/8),
-                                    int(base_width/8), kernel_size=4, stride=4)),
-                                ("out", nn.Conv2d(int(base_width/8), 
-                                num_classes, kernel_size=1))]))
-        """
-                                ("up", nn.ConvTranspose2d(int(base_width/8), 
-                                            int(base_width/32), 
-                                            kernel_size=1, stride=1)),
-        """
-
-        if pretrained:
-            print(":::::::::>>>>>>>       INITIALIZING ONLY THE DECODER")
-            decoder = [self.decoder1, self.decoder2, self.decoder3,
-                        self.decoder4, self.last]#, self.middle]
-            for dec in decoder:
-                initialize_weights(dec)
-        else:
-            print(":::::::::>>>>>>>       INITIALIZING THE WHOLE ARCHITECTURE")
-            initialize_weights(self)
-
-        if freeze_bn:
-            self.freeze_bn()
-        if freeze_backbone: 
-            set_trainable([self.initial, self.layer1, self.layer2, self.layer3, self.layer4], False)
-
-    def forward(self, x):
-        # encoding
-        #import ipdb;ipdb.set_trace()
-        x0 = self.initial(x)
-        x1 = self.layer1(x0)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-        #x5 = self.middle(x4)
-
-        #decoding
-        #import ipdb;ipdb.set_trace()
-        x = self.decoder1(x4)        
-        #x = self.upconv1(x)
-        
-        #x = torch.cat([x3, x], dim=1)
-
-        x = self.decoder2(x3, x)
-        #x = self.upconv2(x)
-        
-        #import ipdb;ipdb.set_trace()
-        #x = torch.cat([x2, x], dim=1)
-
-        x = self.decoder3(x2, x)
-        #x = self.upconv3(x)
-        
-        #x = torch.cat([x1, x], dim=1)
-
-        x = self.decoder4(x1, x)
-        #x = self.upconv4(x)
-
-        #x = self.last.up(x)        
-        x = torch.cat([x0, x], dim=1)
-        x = self.last.norm(self.last.conv(x))
-        x = self.last.lastup(x)
-        #self.feature_map = torch.clone(x).tolist()#.detach()#.to(torch.device('cuda:1'))
-        #x = self.last.out(x)
-        return x
-
-    def get_backbone_params(self):
-        return chain(self.initial.parameters(), self.layer1.parameters(), self.layer2.parameters(), 
-                    self.layer3.parameters(), self.layer4.parameters())
-
-    def get_decoder_params(self):
-        return chain(self.conv1.parameters(), self.upconv1.parameters(), self.conv2.parameters(), self.upconv2.parameters(),
-                    self.conv3.parameters(), self.upconv3.parameters(), self.conv4.parameters(), self.upconv4.parameters(),
-                    self.conv5.parameters(), self.upconv5.parameters(), self.conv6.parameters(), self.conv7.parameters())
-
-    def freeze_bn(self):
-        for module in self.modules():
-            if isinstance(module, nn.BatchNorm2d): module.eval()
-
-
-"""
--> Unet with a SLaK backbone
-    SLaK
-        A PyTorch impl of : 
-        More ConvNets in the 2020s: Scaling up Kernels Beyond 51 x 51 using Sparsity  -
-          https://arxiv.org/abs/2207.03620
-"""
-
-class UNetSLaK(BaseModel):
-    def __init__(self, num_classes, in_channels=3, backbone='SLaK_tiny', 
-                pretrained=True, criterion=nn.CrossEntropyLoss(ignore_index=255),
-                drop_path_rate=0.0, kernel_size=[51,49,47,13,5], width_factor=1.3, Decom=True,
-                bn=True, trans_kernel=[2, 2, 2], backbone_kernel=[7, 7, 7], small_conv=None, 
-                use_convnext_backbone=False, small_trans=None, freeze_bn=False, freeze_backbone=False,**_):
-        super(UNetSLaK, self).__init__()
-        
-        #self.feature_map = torch.zeros([16, 96, 64, 64])
-        self.criterion = criterion
-        model = getattr(SLaK, backbone)(drop_path_rate=drop_path_rate, kernel_size=kernel_size,
-                                        width_factor=width_factor, Decom=Decom, bn=bn)
-        if pretrained:
-            if 'tiny' in backbone:
-                checkpoint = torch.load("/work/ws-tmp/sa058646-segment2/SLaK/models/SLaK_tiny_checkpoint.pth", map_location=torch.device('cpu'))['model']
-            elif 'small' in backbone:
-                checkpoint = torch.load("/work/ws-tmp/sa058646-segment2/SLaK/models/SLaK_small_checkpoint.pth", map_location=torch.device('cpu'))['model']
-            elif 'base' in backbone:
-                checkpoint = torch.load("/work/ws-tmp/sa058646-segment2/SLaK/models/SLaK_base_checkpoint.pth", map_location=torch.device('cpu'))['model']
-            else:
-                raise NotImplementedError('pretrained specified for an architecture that is not supported!')
-            model.load_state_dict(checkpoint)
-        base_width = model.head.in_features
-        self.base_width=base_width        
-        
-        self.initial = list(model.downsample_layers[0])  
-        
-        if in_channels != 3:
-            self.initial[0] = nn.Conv2d(in_channels, 96, kernel_size=4, stride=4, padding=0, bias=False)
-        self.initial = nn.Sequential(*self.initial)
-
-        # encoder
-        self.layer1 = model.stages[0]
-        self.layer2 = nn.Sequential(model.downsample_layers[1], model.stages[1])
-        self.layer3 = nn.Sequential(model.downsample_layers[2], model.stages[2])
-        self.layer4 = nn.Sequential(model.downsample_layers[3], model.stages[3])
-
-        # decoder         
-        self.decoder1 = x2conv(int(base_width), int(base_width))
-        self.decoder2 = decoder_resnet(base_width/2, int(base_width/2), 
-                                        kernel_size=trans_kernel[0], small_trans=small_trans,
-                                        backbone_kernel=backbone_kernel[0], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        self.decoder3 = decoder_resnet(base_width/4, int(base_width/4), small_trans=small_trans,
-                                        kernel_size=trans_kernel[1], backbone_kernel=backbone_kernel[1], 
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-        self.decoder4 = decoder_resnet(base_width/8, int(base_width/8), kernel_size=trans_kernel[2], 
-                                        backbone_kernel=backbone_kernel[2], small_trans=small_trans,
-                                        use_convnext_backbone=use_convnext_backbone,
-                                        small_conv=small_conv)
-    
-        self.last = nn.Sequential(OrderedDict([
-                                ("conv", nn.Conv2d(int(base_width/8)*2, 
-                                int(base_width/8), kernel_size=1)),
-                                ("norm", nn.ReLU(nn.BatchNorm2d(int(base_width/8)))),
-                                ("lastup", nn.ConvTranspose2d(int(base_width/8),
-                                    int(base_width/8), kernel_size=4, stride=4)),
-                                ("out", nn.Conv2d(int(base_width/8), 
-                                num_classes, kernel_size=1))]))
-        """
-                                ("up", nn.ConvTranspose2d(int(base_width/8), 
-                                            int(base_width/32), 
-                                            kernel_size=1, stride=1)),
-        """
-
-        if pretrained:
-            print(":::::::::>>>>>>>       INITIALIZING ONLY THE DECODER")
-            decoder = [self.decoder1, self.decoder2, self.decoder3,
-                        self.decoder4, self.last]#, self.middle]
-            for dec in decoder:
-                initialize_weights(dec)
-        else:
-            print(":::::::::>>>>>>>       INITIALIZING THE WHOLE ARCHITECTURE")
-            initialize_weights(self)
-
-        if freeze_bn:
-            self.freeze_bn()
-        if freeze_backbone: 
-            set_trainable([self.initial, self.layer1, self.layer2, self.layer3, self.layer4], False)
-
-    def forward(self, x):
-        # encoding
-        x0 = self.initial(x)
-        x1 = self.layer1(x0)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-        #x5 = self.middle(x4)
-
-        #decoding
-        #import ipdb;ipdb.set_trace()
-        x = self.decoder1(x4)        
-        #x = self.upconv1(x)
-        
-        #x = torch.cat([x3, x], dim=1)
-
-        x = self.decoder2(x3, x)
-        #x = self.upconv2(x)
-        
-        #import ipdb;ipdb.set_trace()
-        #x = torch.cat([x2, x], dim=1)
-
-        x = self.decoder3(x2, x)
-        #x = self.upconv3(x)
-        
-        #x = torch.cat([x1, x], dim=1)
-
-        x = self.decoder4(x1, x)
-        #x = self.upconv4(x)
-
-        #x = self.last.up(x)        
-        x = torch.cat([x0, x], dim=1)
-        x = self.last.norm(self.last.conv(x))
-        x = self.last.lastup(x)
-        #self.feature_map = torch.clone(x)
-        #x = self.last.out(x)
-        return x
-
-    def get_backbone_params(self):
-        return chain(self.initial.parameters(), self.layer1.parameters(), self.layer2.parameters(), 
-                    self.layer3.parameters(), self.layer4.parameters())
-
-    def get_decoder_params(self):
-        return chain(self.decoder1.parameters(), self.decoder2.parameters(), self.decoder3.parameters(), 
-                    self.decoder4.parameters(), self.last.parameters())
-
-    def freeze_bn(self):
-        for module in self.modules():
-            if isinstance(module, nn.BatchNorm2d): module.eval()
+360.19434
+-1802.10596	1732.32544	4359.73242
+-1787.77612	1727.89148	4359.29346
+-1773.44165	1723.46228	4358.87744
+-1759.10229	1719.03796	4358.48486
+-1744.80298	1714.62634	4358.09424
+-1730.45398	1710.21179	4357.74805
+-1716.09985	1705.80188	4357.4248
+-1701.7854	1701.40491	4357.10498
+-1687.46533	1697.01257	4356.80811
+-1673.09473	1692.61719	4356.55566
+-1658.76355	1688.23438	4356.30615
+-1644.42627	1683.8562	4356.08057
+-1630.08301	1679.48291	4355.87891
+-1615.73352	1675.11414	4355.70117
+-1601.37744	1670.74988	4355.54688
+-1587.01428	1666.38965	4355.41504
+-1572.64465	1662.0343	4355.30859
+-1558.31238	1657.69141	4355.20654
+-1543.97314	1653.35303	4355.12891
+-1529.58191	1649.01086	4355.09424
+-1515.22754	1644.68103	4355.06445
+-1500.86523	1640.35571	4355.05957
+-1486.495	1636.03467	4355.0791
+-1472.16089	1631.72583	4355.104
+-1457.77356	1627.41284	4355.17188
+-1443.42188	1623.1123	4355.24658
+-1429.0166	1618.80701	4355.36279
+-1414.64709	1614.5144	4355.48633
+-1400.26758	1610.22559	4355.63477
+-1385.92346	1605.94983	4355.7915
+-1371.52417	1601.66846	4355.98877
+-1357.15857	1597.39941	4356.19385
+-1342.78369	1593.13489	4356.42578
+-1328.39722	1588.87317	4356.68066
+-1313.99976	1584.61536	4356.96191
+-1299.63513	1580.36926	4357.25098
+-1285.25903	1576.12708	4357.56592
+-1270.87134	1571.88843	4357.90723
+-1256.47095	1567.65271	4358.27246
+-1242.10254	1563.4292	4358.64795
+-1227.72119	1559.20886	4359.04883
+-1213.32703	1554.9917	4359.47607
+-1198.91907	1550.77759	4359.9292
+-1184.54163	1546.57507	4360.39111
+-1170.15002	1542.37549	4360.87988
+-1155.7439	1538.17859	4361.39404
+-1141.36792	1533.9939	4361.91992
+-1126.97644	1529.81165	4362.47168
+-1112.5697	1525.63196	4363.0498
+-1098.19165	1521.46436	4363.64062
+-1083.797	1517.29858	4364.25586
+-1069.38599	1513.13513	4364.89844
+-1055.00244	1508.98315	4365.55273
+-1040.60168	1504.8335	4366.23438
+-1026.18335	1500.68579	4366.94189
+-1011.79126	1496.54932	4367.66211
+-997.38147	1492.41528	4368.41113
+-982.996826	1488.29199	4369.1709
+-968.592773	1484.17041	4369.95898
+-954.170044	1480.05042	4370.77393
+-939.77063	1475.94092	4371.60107
+-925.395752	1471.84314	4372.44434
+-910.956055	1467.73645	4373.32617
+-896.583862	1463.65063	4374.20996
+-882.145874	1459.55579	4375.1333
+-867.774414	1455.48169	4376.05957
+-853.336548	1451.39844	4377.02539
+-838.964478	1447.33582	4377.99414
+-824.569092	1443.27368	4378.99023
+-810.150024	1439.21167	4380.01318
+-795.751587	1435.16064	4381.05371
+-781.328491	1431.10938	4382.12012
+-766.924805	1427.06824	4383.20215
+-752.540283	1423.03748	4384.30225
+-738.129761	1419.00671	4385.42969
+-723.737427	1414.9856	4386.57275
+-709.318115	1410.96411	4387.74414
+-694.916504	1406.95203	4388.93164
+-680.486694	1402.93945	4390.14746
+-666.118042	1398.94751	4391.37061
+-651.676025	1394.94312	4392.62988
+-637.294067	1390.95923	4393.89844
+-622.882324	1386.97388	4395.19434
+-608.485107	1382.99792	4396.5083
+-594.101807	1379.03088	4397.83984
+-579.687744	1375.06238	4399.2002
+-565.286499	1371.10291	4400.57861
+-550.897949	1367.15173	4401.97412
+-536.476807	1363.19873	4403.39893
+-522.067505	1359.25439	4404.84229
+-507.669189	1355.31848	4406.3042
+-493.280884	1351.39062	4407.78467
+-478.859009	1347.46057	4409.29443
+-464.490723	1343.54956	4410.81445
+-450.087402	1339.63562	4412.36279
+-435.692139	1335.72937	4413.92969
+-421.30603	1331.83118	4415.5166
+-406.882324	1327.92908	4417.13086
+-392.51001	1324.04614	4418.7583
+-378.100342	1320.1593	4420.4126
+-363.696533	1316.27954	4422.08691
+-349.298218	1312.40723	4423.78174
+-334.905396	1308.54199	4425.49658
+-320.516602	1304.68335	4427.23145
+-306.13208	1300.83154	4428.98633
+-291.751343	1296.98694	4430.76367
+-277.373657	1293.1488	4432.56104
+-262.998657	1289.31702	4434.37891
+-248.581055	1285.47949	4436.22266
+-234.209229	1281.6604	4438.08398
+-219.838745	1277.84692	4439.96387
+-205.424561	1274.02771	4441.87109
+-191.054688	1270.22632	4443.79443
+-176.684204	1266.4303	4445.73877
+-162.312744	1262.64014	4447.70459
+-147.940186	1258.85498	4449.69141
+-133.565186	1255.07495	4451.69873
+-119.1875	1251.30017	4453.72852
+-104.807251	1247.53027	4455.7793
+-90.4233398	1243.76538	4457.85156
+-76.0356445	1240.005	4459.94531
+-61.6875	1236.26135	4462.05664
+-47.3344727	1232.52197	4464.18896
+-32.9318848	1228.77466	4466.34668
+-18.5671387	1225.04321	4468.521
+-4.24047852	1221.32898	4470.71582
+10.1374512	1217.60522	4472.93311
+24.4785156	1213.89844	4475.17139
+38.8720703	1210.18201	4477.43262
+53.229248	1206.48169	4479.71289
+67.5515137	1202.797	4482.01074
+81.9274902	1199.10291	4484.33447
+96.2687988	1195.42432	4486.67725
+110.621094	1191.74829	4489.04053
+124.983398	1188.07495	4491.42578
+139.313232	1184.41699	4493.83008
+153.655029	1180.76123	4496.25586
+168.009033	1177.10767	4498.7041
+182.330566	1173.46887	4501.1709
+196.666504	1169.83203	4503.65967
+211.016113	1166.19666	4506.16895
+225.334351	1162.57642	4508.69922
+239.668457	1158.95691	4511.25
+254.01709	1155.33899	4513.82227
+268.337158	1151.73535	4516.41553
+282.672974	1148.13245	4519.0293
+296.981201	1144.54346	4521.66357
+311.305786	1140.95557	4524.31934
+325.603516	1137.38135	4526.99561
+339.918945	1133.80725	4529.69238
+354.253174	1130.2334	4532.41016
+368.560791	1126.67322	4535.14941
+382.88855	1123.11243	4537.90771
+397.19043	1119.56519	4540.68799
+411.467651	1116.03137	4543.48926
+425.765747	1112.49683	4546.31152
+440.084839	1108.9613	4549.1543
+454.379883	1105.43921	4552.01807
+468.652588	1101.9292	4554.90234
+482.947021	1098.41833	4557.80762
+497.264526	1094.90613	4560.73242
+511.559937	1091.40637	4563.67969
+525.833984	1087.9187	4566.64697
+540.086548	1084.4436	4569.63672
+554.36377	1080.96655	4572.64697
+568.665527	1077.48706	4575.67529
+582.947021	1074.02002	4578.72607
+597.208984	1070.56421	4581.79688
+611.451782	1067.12048	4584.89111
+625.720703	1063.67419	4588.00488
+639.971069	1060.23901	4591.13867
+654.248413	1056.80139	4594.29248
+668.50769	1053.37476	4597.46777
+682.749878	1049.95947	4600.66504
+697.019775	1046.54077	4603.88086
+711.227661	1043.14771	4607.12207
+725.464233	1039.7511	4610.38184
+739.729492	1036.35046	4613.65869
+753.979614	1032.96069	4616.95801
+768.213623	1029.58167	4620.27979
+782.432373	1026.21301	4623.62207
+796.636108	1022.85486	4626.9873
+810.87085	1019.49261	4630.37061
+825.091187	1016.14044	4633.77539
+839.297607	1012.79828	4637.20117
+853.535156	1009.45129	4640.64453
+867.714111	1006.12976	4644.11572
+881.925293	1002.80298	4647.60254
+896.123413	999.485901	4651.1123
+910.309082	996.178833	4654.64355
+924.527466	992.866089	4658.19092
+938.734619	989.562866	4661.76074
+952.883545	986.28479	4665.35791
+967.065918	983.000916	4668.9707
+981.283325	979.710632	4672.59961
+995.44397	976.445557	4676.25684
+1009.59338	973.189453	4679.93555
+1023.77808	969.927246	4683.63086
+1037.95166	966.67395	4687.34668
+1052.11523	963.429932	4691.08496
+1066.26892	960.194458	4694.84375
+1080.41296	956.968262	4698.62598
+1094.54736	953.750732	4702.42871
+1108.71777	950.526367	4706.24707
+1122.83337	947.326538	4710.09473
+1136.98572	944.119507	4713.95605
+1151.12939	940.920898	4717.83936
+1165.21863	937.746948	4721.75195
+1179.34521	934.56543	4725.67871
+1193.4635	931.392395	4729.62793
+1207.57373	928.227722	4733.59766
+1221.72241	925.055115	4737.58105
+1235.8175	921.907104	4741.59619
+1249.90405	918.767334	4745.63135
+1263.9834	915.635742	4749.68945
+1278.10168	912.495972	4753.75977
+1292.16687	909.380371	4757.86035
+1306.27075	906.256531	4761.97314
+1320.36804	903.140808	4766.1084
+1334.41235	900.049316	4770.27441
+1348.4967	896.949158	4774.45215
+1362.57385	893.857178	4778.65234
+1376.59839	890.789368	4782.88281
+1390.66321	887.71283	4787.12646
+1404.72229	884.643799	4791.39111
+1418.77515	881.582764	4795.67773
+1432.82202	878.529297	4799.98535
+1446.81628	875.500427	4804.32568
+1460.85168	872.462402	4808.67676
+1474.88062	869.431763	4813.04932
+1488.90479	866.408569	4817.44287
+1502.92346	863.392944	4821.8584
+1516.93628	860.384888	4826.29541
+1530.94446	857.384644	4830.75537
+1544.94641	854.391479	4835.23535
+1558.94434	851.405884	4839.7373
+1572.93665	848.427734	4844.26123
+1586.92358	845.456909	4848.80566
+1600.8584	842.510986	4853.38477
+1614.83545	839.555237	4857.97363
+1628.8075	836.606689	4862.58301
+1642.7749	833.665283	4867.21436
+1656.73743	830.731323	4871.86719
+1670.69482	827.80481	4876.54102
+1684.64844	824.88562	4881.23828
+1698.54883	821.991455	4885.96875
+1712.49207	819.086914	4890.70801
+1726.43103	816.189453	4895.46875
+1740.3656	813.2995	4900.25146
+1754.24756	810.435059	4905.07031
+1768.17261	807.559692	4909.89648
+1782.04517	804.709595	4914.75684
+1795.96106	801.848999	4919.62695
+1809.87195	798.995544	4924.51855
+1823.73071	796.167603	4929.44531
+1837.63171	793.328735	4934.37891
+1851.48181	790.515503	4939.34961
+1865.32666	787.709839	4944.34277
+1879.21399	784.893066	4949.3418
+1893.04968	782.102112	4954.37891
+1906.88013	779.318542	4959.43701
+1920.75415	776.523926	4964.50244
+1934.57458	773.755127	4969.604
+1948.39136	770.993774	4974.72852
+1962.20264	768.23999	4979.875
+1976.00903	765.493896	4985.04395
+1989.81091	762.755127	4990.23438
+2003.60706	760.023987	4995.44727
+2017.39929	757.300537	5000.68262
+2031.18591	754.584351	5005.93994
+2044.96777	751.875977	5011.2207
+2058.7439	749.175232	5016.52148
+2072.51562	746.482178	5021.84668
+2086.28174	743.796631	5027.19336
+2099.99438	741.138245	5032.58057
+2113.74951	738.46814	5037.9707
+2127.5	735.80603	5043.38574
+2141.19556	733.171265	5048.84033
+2154.93481	730.524597	5054.2998
+2168.61963	727.905579	5059.7998
+2182.34717	725.274658	5065.30469
+2196.02051	722.671387	5070.84961
+2209.6875	720.076416	5076.41895
+2223.39648	717.469788	5081.99121
+2237.05225	714.890747	5087.60645
+2247.05225	713.005127	5091.72852
+2247.05225	713.005127	5091.72852
+2260.73438	710.426392	5097.37402
+2274.36523	707.876953	5103.06982
+2287.99219	705.336975	5108.79639
+2301.6167	702.80658	5114.55518
+2315.18921	700.305542	5120.36377
+2328.80762	697.793701	5126.18408
+2342.37305	695.311523	5132.0542
+2355.93457	692.839233	5137.95654
+2369.49316	690.376343	5143.88965
+2376.6958	689.067749	5147.04004
+2376.6958	689.067749	5147.04004
+2389.95264	686.897278	5153.7124
+2403.15845	684.757629	5160.44092
+2416.41113	682.607727	5167.18359
+2429.61035	680.48938	5173.98291
+2442.80762	678.381042	5180.81738
+2455.95117	676.304077	5187.70654
+2469.09082	674.237671	5194.63086
+2482.22754	672.181763	5201.58984
+2495.30908	670.157837	5208.60547
+2508.43652	668.123413	5215.6333
+2521.50928	666.12085	5222.7168
+2534.52637	664.149902	5229.85596
+2547.58887	662.169067	5237.0083
+2560.59473	660.220276	5244.21631
+2573.54443	658.303772	5251.47949
+2586.53906	656.377136	5258.75586
+2599.47607	654.482971	5266.0874
+2612.40674	652.600037	5273.45312
+2625.32959	650.728394	5280.85156
+2638.24487	648.868164	5288.28418
+2651.10254	647.040894	5295.77295
+2654.72461	646.536133	5297.91992
+2654.72461	646.536133	5297.91992
+2667.42773	644.848389	5305.74902
+2680.07129	643.194214	5313.63672
+2692.7063	641.552246	5321.55908
+2705.33203	639.922241	5329.51514
+2717.89697	638.326538	5337.52979
+2730.45239	636.743042	5345.5791
+2742.99658	635.171936	5353.66162
+2755.48047	633.635254	5361.80273
+2768.00293	632.089355	5369.95312
+2780.46436	630.578308	5378.16406
+2792.91309	629.079834	5386.40625
+2805.29736	627.616638	5394.70801
+2817.72217	626.144043	5403.01904
+2830.08203	624.706726	5411.38818
+2842.42822	623.282776	5419.79102
+2851.34131	622.27063	5425.91504
+2851.34131	622.27063	5425.91504
+2863.64844	620.875488	5434.38086
+2875.93848	619.493286	5442.87451
+2888.21191	618.123779	5451.39648
+2900.41504	616.790405	5459.97363
+2912.65479	615.447693	5468.55664
+2924.87646	614.118286	5477.16846
+2937.02686	612.824951	5485.83398
+2949.20557	611.521545	5494.49316
+2961.41089	610.207275	5503.14355
+2973.58887	608.90509	5511.80664
+2974.68359	608.79248	5512.60156
+2974.68359	608.79248	5512.60156
+2986.88672	607.477905	5521.24707
+2999.06201	606.175781	5529.9082
+3011.21094	604.88562	5538.5835
+3013.81982	604.601196	5540.41943
+3013.81982	604.601196	5540.41943
+3025.18677	603.844116	5550.18604
+3026.09229	603.789001	5550.98242
+3026.09229	603.789001	5550.98242
+3037.06445	603.276306	5561.20898
+3041.62256	603.067627	5565.47266
+-3557.95239	2350.26465	4686.37646
+-3557.95239	2350.26465	4686.37646
+-3544.94189	2345.08643	4680.94092
+-3532.00513	2339.91211	4675.44971
+-3518.99292	2334.73462	4670.01807
+-3516.23779	2333.63867	4668.86963
+-3516.23779	2333.63867	4668.86963
+-3503.30225	2328.46411	4663.37598
+-3490.33911	2323.28711	4657.90039
+-3477.35156	2318.10962	4652.44629
+-3464.34326	2312.93433	4647.01855
+-3451.36719	2307.76562	4641.58398
+-3438.3269	2302.6001	4636.21973
+-3425.32202	2297.44312	4630.85205
+-3412.25488	2292.29004	4625.55664
+-3399.22241	2287.14502	4620.25635
+-3386.12646	2282.00269	4615.02441
+-3384.96655	2281.55518	4614.58838
+-3384.96655	2281.55518	4614.58838
+-3371.91064	2276.42285	4609.35352
+-3358.74707	2271.29321	4604.22949
+-3345.62231	2266.17407	4599.10498
+-3332.48828	2261.06323	4594.01709
+-3319.29688	2255.95776	4589.00195
+-3306.09692	2250.8606	4584.02393
+-3292.88818	2245.77148	4579.08105
+-3279.62402	2240.68848	4574.21191
+-3266.3999	2235.61597	4569.3418
+-3253.12061	2230.55005	4564.54443
+-3239.78638	2225.48975	4559.81934
+-3226.49438	2220.44116	4555.09473
+-3213.14795	2215.39893	4550.44238
+-3199.79614	2210.36548	4545.82617
+-3186.43848	2205.34082	4541.24561
+-3176.82886	2201.74536	4538.0166
+-3176.82886	2201.74536	4538.0166
+-3163.27515	2196.79663	4533.88135
+-3149.71631	2191.85645	4529.7793
+-3136.15405	2186.92554	4525.71387
+-3122.58765	2182.00366	4521.68213
+-3108.96924	2177.08765	4517.71973
+-3095.34863	2172.1814	4513.79297
+-3081.72437	2167.28394	4509.90039
+-3068.05005	2162.39307	4506.07715
+-3054.37378	2157.51172	4502.28857
+-3040.69507	2152.63989	4498.53418
+-3027.01514	2147.77808	4494.81592
+-3013.28613	2142.92261	4491.16553
+-2999.55518	2138.07642	4487.5498
+-2985.82471	2133.24121	4483.96973
+-2972.09302	2128.41553	4480.42383
+-2958.31396	2123.59692	4476.94727
+-2944.53467	2118.78809	4473.50488
+-2930.70825	2113.98633	4470.13037
+-2916.88281	2109.19482	4466.79102
+-2903.05786	2104.41382	4463.48633
+-2889.23462	2099.6438	4460.21826
+-2885.55615	2098.37817	4459.36035
+-2885.55615	2098.37817	4459.36035
+-2871.49609	2093.77661	4456.89404
+-2857.43555	2089.18433	4454.45898
+-2843.32715	2084.59717	4452.08643
+-2829.26514	2080.02271	4449.71338
+-2815.15649	2075.45386	4447.40381
+-2801.04736	2070.89355	4445.12451
+-2786.93896	2066.34326	4442.87842
+-2772.78369	2061.79785	4440.69385
+-2758.67529	2057.26562	4438.50879
+-2751.34521	2054.92456	4437.4209
+-2751.34521	2054.92456	4437.4209
+-2737.21362	2050.40332	4435.29639
+-2723.07764	2045.88757	4433.19482
+-2708.89136	2041.37415	4431.14844
+-2694.74829	2036.87061	4429.09521
+-2680.60181	2032.37329	4427.06689
+-2666.40527	2027.87781	4425.0918
+-2652.25195	2023.39233	4423.11035
+-2638.04834	2018.90869	4421.18262
+-2623.88843	2014.43555	4419.24951
+-2609.6792	2009.96411	4417.36914
+-2595.46655	2005.49866	4415.51172
+-2581.25073	2001.03894	4413.67725
+-2567.07812	1996.5896	4411.83789
+-2552.85693	1992.14185	4410.05029
+-2538.63184	1987.69983	4408.28564
+-2524.40479	1983.26453	4406.54492
+-2510.17456	1978.83472	4404.82666
+-2495.94189	1974.41089	4403.13184
+-2481.70605	1969.99292	4401.45947
+-2467.46826	1965.58118	4399.81055
+-2453.22754	1961.17517	4398.18408
+-2438.98413	1956.77539	4396.58057
+-2424.73804	1952.38135	4395.0
+-2410.4436	1947.98853	4393.46924
+-2396.19312	1943.60669	4391.93457
+-2381.9397	1939.23047	4390.42236
+-2367.6377	1934.85535	4388.95898
+-2353.37964	1930.49133	4387.49268
+-2339.11938	1926.13318	4386.04834
+-2324.81079	1921.77625	4384.65381
+-2310.54541	1917.42969	4383.25391
+-2296.23193	1913.08435	4381.9043
+-2281.91577	1908.74463	4380.57568
+-2267.64355	1904.41626	4379.24512
+-2253.32275	1900.0885	4377.96191
+-2239.04614	1895.77197	4376.67578
+-2224.72095	1891.45618	4375.4375
+-2210.39258	1887.14551	4374.2207
+-2196.06299	1882.84167	4373.02783
+-2181.77612	1878.54834	4371.83105
+-2167.44141	1874.25598	4370.68262
+-2153.10352	1869.96899	4369.55566
+-2138.76367	1865.68835	4368.45117
+-2124.42114	1861.41321	4367.36914
+-2110.07617	1857.14392	4366.30957
+-2095.72827	1852.88025	4365.27197
+-2081.37842	1848.62305	4364.25781
+-2067.02539	1844.37097	4363.26514
+-2052.66943	1840.12463	4362.29395
+-2038.35645	1835.89001	4361.32275
+-2023.995	1831.65552	4360.39795
+-2009.63037	1827.42639	4359.49414
+-1995.26294	1823.20325	4358.61377
+-1980.89294	1818.98608	4357.75635
+-1966.51929	1814.77441	4356.9209
+-1952.14209	1810.56787	4356.10645
+-1937.76196	1806.36768	4355.31592
+-1923.37854	1802.17297	4354.54785
+-1908.9917	1797.98376	4353.80273
+-1894.60107	1793.80005	4353.0791
+-1880.20654	1789.62195	4352.37891
+-1865.80859	1785.44946	4351.70068
+-1851.4071	1781.28308	4351.04688
+-1837.04614	1777.12769	4350.39209
+-1822.63672	1772.97217	4349.78271
+-1808.22241	1768.82166	4349.19531
+-1793.8042	1764.67688	4348.63184
+-1779.42651	1760.54395	4348.06982
+-1764.99902	1756.41003	4347.55127
+-1750.56714	1752.28149	4347.05615
+-1736.17493	1748.16455	4346.56299
+-1721.73291	1744.04675	4346.11377
+-1707.33081	1739.94043	4345.6665
+-1692.92407	1735.84021	4345.24414
+-1678.4657	1731.73792	4344.86377
+-1664.04773	1727.64807	4344.48779
+-1649.62329	1723.56287	4344.1333
+-1635.19312	1719.48315	4343.80322
+-1620.75671	1715.40857	4343.49707
+-1606.31445	1711.33936	4343.21436
+-1591.91028	1707.28162	4342.93555
+-1577.45447	1703.22229	4342.69922
+-1563.03699	1699.17505	4342.46875
+-1548.5675	1695.12573	4342.28027
+-1534.13513	1691.08801	4342.09619
+-1519.69568	1687.05518	4341.93652
+-1505.24854	1683.02771	4341.80127
+-1490.79321	1679.00439	4341.68896
+-1476.3302	1674.98669	4341.60205
+-1461.85889	1670.97339	4341.53857
+-1447.4231	1666.97144	4341.47998
+-1432.97876	1662.97437	4341.44678
+-1418.52551	1658.98218	4341.43848
+-1404.06323	1654.99451	4341.45459
+-1389.59131	1651.01135	4341.49512
+-1375.1095	1647.03247	4341.55957
+-1360.66248	1643.06555	4341.63184
+-1346.2052	1639.10327	4341.72949
+-1331.73718	1635.14478	4341.85059
+-1317.25818	1631.19043	4341.99707
+-1302.76807	1627.2406	4342.16895
+-1288.31177	1623.30273	4342.34912
+-1273.84326	1619.36853	4342.5542
+-1259.36304	1615.43848	4342.78418
+-1244.87036	1611.51233	4343.03955
+-1230.40991	1607.59802	4343.30469
+-1215.93665	1603.68738	4343.59521
+-1201.44983	1599.7804	4343.91016
+-1186.99475	1595.8855	4344.23682
+-1172.48083	1591.98596	4344.60352
+-1157.99731	1588.09766	4344.97998
+-1143.54382	1584.22095	4345.36768
+-1129.03162	1580.34021	4345.79688
+-1114.54834	1576.47034	4346.23584
+-1100.04956	1572.60364	4346.70068
+-1085.58008	1568.7489	4347.17871
+-1071.09424	1564.89697	4347.68164
+-1056.5918	1561.04822	4348.21094
+-1042.11707	1557.21069	4348.75293
+-1027.625	1553.37573	4349.32031
+-1013.11511	1549.54382	4349.91455
+-998.632202	1545.7229	4350.52148
+-984.131104	1541.90491	4351.15527
+-969.655273	1538.09741	4351.80078
+-955.160645	1534.29285	4352.47412
+-940.646729	1530.49048	4353.17383
+-926.15686	1526.69885	4353.88721
+-911.69165	1522.91821	4354.61475
+-897.160889	1519.13074	4355.38086
+-882.698486	1515.36279	4356.14941
+-868.169922	1511.58801	4356.95752
+-853.708618	1507.83289	4357.76904
+-839.180054	1504.07031	4358.61816
+-824.67334	1500.31812	4359.48242
+-810.188354	1496.57629	4360.3623
+-795.679443	1492.83582	4361.26855
+-781.190796	1489.10559	4362.19141
+-766.722534	1485.38586	4363.13086
+-752.18457	1481.65796	4364.10791
+-737.710693	1477.94922	4365.08984
+-723.210449	1474.24097	4366.09863
+-708.684448	1470.53369	4367.13574
+-694.220703	1466.8457	4368.1792
+-679.684937	1463.14844	4369.25928
+-665.210815	1459.47021	4370.34668
+-650.708496	1455.79211	4371.46045
+-636.222412	1452.1239	4372.59277
+-621.707031	1448.45532	4373.75195
+-607.207275	1444.79663	4374.93066
+-592.721436	1441.14673	4376.12549
+-578.2052	1437.49634	4377.34717
+-563.702759	1433.85498	4378.5874
+-549.213379	1430.22278	4379.84668
+-534.692261	1426.58984	4381.13379
+-520.228027	1422.97546	4382.42969
+-505.730347	1419.35986	4383.75293
+-491.199829	1415.74304	4385.104
+-476.724609	1412.14478	4386.46582
+-462.214355	1408.54456	4387.85449
+-447.7146	1404.95312	4389.26221
+-433.223999	1401.36938	4390.68945
+-418.741455	1397.79407	4392.13672
+-404.267944	1394.22668	4393.60303
+-389.757202	1390.6571	4395.09668
+-375.253662	1387.09534	4396.61035
+-360.756958	1383.54089	4398.14258
+-346.266479	1379.99426	4399.6958
+-331.78186	1376.45532	4401.26953
+-317.302368	1372.92334	4402.86279
+-302.827393	1369.39868	4404.47656
+-288.312134	1365.87097	4406.11768
+-273.844971	1362.36023	4407.77246
+-259.337158	1358.84631	4409.4541
+-244.875854	1355.34961	4411.15039
+-230.372314	1351.84912	4412.87402
+-215.870483	1348.35449	4414.61621
+-201.414551	1344.87744	4416.375
+-186.914307	1341.39575	4418.16016
+-172.459229	1337.9314	4419.96143
+-157.958984	1334.46179	4421.78809
+-143.502563	1331.00903	4423.63086
+-128.999756	1327.55115	4425.49951
+-114.539917	1324.10999	4427.38525
+-100.077881	1320.67456	4429.29199
+-85.567627	1317.23291	4431.22363
+-71.0991211	1313.80786	4433.17285
+-56.6264648	1310.38806	4435.14355
+-42.1494141	1306.97327	4437.13574
+-27.7124023	1303.57434	4439.14453
+-13.2248535	1300.16907	4441.17871
+1.22412109	1296.77954	4443.23096
+15.6791992	1293.39441	4445.3042
+30.1413574	1290.01404	4447.3999
+44.611084	1286.63745	4449.5166
+59.0883789	1283.26489	4451.65332
+73.5300293	1279.90784	4453.80957
+87.9802246	1276.55493	4455.98828
+102.440186	1273.20532	4458.18799
+116.909668	1269.85901	4460.40723
+131.344971	1266.52808	4462.64697
+145.79126	1263.20032	4464.9082
+160.249268	1259.87549	4467.19092
+174.71875	1256.55396	4469.49512
+189.156006	1253.24658	4471.81738
+203.606201	1249.94202	4474.16162
+218.024658	1246.65222	4476.52637
+232.456909	1243.36462	4478.9126
+246.903687	1240.07922	4481.31885
+261.365234	1236.79578	4483.74707
+275.796875	1233.52661	4486.19434
+290.199219	1230.27124	4488.6626
+304.618286	1227.01782	4491.15234
+319.053589	1223.76562	4493.66162
+333.506226	1220.51501	4496.19336
+347.93103	1217.27771	4498.74414
+362.329224	1214.05432	4501.31689
+376.745361	1210.83154	4503.90918
+391.180786	1207.60962	4506.52246
+405.590332	1204.40076	4509.15674
+419.974609	1201.20544	4511.8125
+434.424316	1197.99731	4514.4873
+448.804443	1194.81506	4517.18408
+463.205566	1191.63281	4519.90088
+477.628296	1188.45032	4522.6377
+492.02771	1185.28088	4525.39697
+506.404663	1182.12354	4528.17627
+520.803589	1178.96619	4530.97607
+535.18103	1175.82104	4533.79785
+549.582397	1172.67493	4536.63916
+563.961914	1169.54114	4539.50098
+578.365845	1166.40588	4542.38184
+592.749512	1163.28296	4545.28564
+607.113525	1160.17188	4548.21143
+621.502563	1157.0592	4551.1543
+635.871948	1153.95813	4554.12012
+650.222778	1150.8689	4557.10791
+664.600464	1147.77759	4560.11426
+678.959717	1144.69788	4563.14258
+693.346313	1141.6156	4566.18848
+707.670044	1138.55859	4569.26074
+722.067017	1135.48523	4572.34717
+736.401855	1132.43652	4575.45898
+750.765869	1129.38501	4578.58887
+765.113281	1126.34473	4581.74023
+779.445068	1123.31506	4584.91455
+793.760742	1120.29602	4588.11035
+808.107056	1117.2738	4591.32324
+822.438232	1114.26208	4594.55811
+836.800049	1111.24683	4597.81006
+851.102417	1108.25574	4601.08789
+865.435791	1105.26123	4604.38379
+879.755859	1102.27673	4607.70215
+894.06189	1099.30249	4611.04102
+908.401001	1096.3241	4614.39795
+922.681152	1093.36975	4617.78125
+936.993896	1090.41101	4621.18018
+951.294678	1087.4624	4624.60254
+965.583374	1084.52332	4628.04639
+979.905396	1081.57959	4631.50488
+994.216309	1078.64502	4634.98535
+1008.46997	1075.73486	4638.49512
+1022.75842	1072.81958	4642.01953
+1037.03601	1069.91357	4645.56592
+1051.34875	1067.0022	4649.12744
+1065.6051	1064.11475	4652.71729
+1079.89697	1061.22205	4656.32227
+1094.1333	1058.35327	4659.95703
+1108.40576	1055.47839	4663.60547
+1122.66821	1052.61279	4667.27637
+1136.92175	1049.75586	4670.96777
+1151.16589	1046.90796	4674.68164
+1165.401	1044.06885	4678.41699
+1179.67395	1041.22327	4682.16602
+1193.89197	1038.40161	4685.94434
+1208.14746	1035.57349	4689.73682
+1222.34863	1032.76904	4693.55908
+1236.58813	1029.95813	4697.39453
+1250.82007	1027.15552	4701.25244
+1265.04407	1024.36145	4705.13135
+1279.2605	1021.57556	4709.03125
+1293.46948	1018.7981	4712.95361
+1307.67151	1016.02917	4716.89746
+1321.86621	1013.26843	4720.86328
+1336.05396	1010.51556	4724.84961
+1350.23486	1007.7713	4728.85791
+1364.45581	1005.01947	4732.87891
+1378.62366	1002.29089	4736.92969
+1392.78491	999.571045	4741.00391
+1406.98706	996.843079	4745.08887
+1421.13611	994.138977	4749.20508
+1435.27856	991.442993	4753.34326
+1449.46252	988.73877	4757.49219
+1463.59338	986.058594	4761.67334
+1477.76538	983.370117	4765.86475
+1491.88525	980.705688	4770.08936
+1506.04639	978.032837	4774.32471
+1520.15479	975.383911	4778.5918
+1534.30542	972.726685	4782.87012
+1548.45044	970.076843	4787.16797
+1562.54272	967.451111	4791.49951
+1576.67725	964.816711	4795.8418
+1590.76013	962.206543	4800.2168
+1604.88464	959.587585	4804.60156
+1618.95667	956.992554	4809.01904
+1633.07129	954.388672	4813.44629
+1647.13452	951.80896	4817.90723
+1661.23962	949.220337	4822.37793
+1675.29211	946.655884	4826.88135
+1689.38843	944.082092	4831.39453
+1703.43225	941.533142	4835.94238
+1717.51843	938.974243	4840.49707
+1731.55286	936.440186	4845.08789
+1745.63062	933.896545	4849.68652
+1759.65576	931.377563	4854.31982
+1773.67688	928.866089	4858.9751
+1787.74109	926.345093	4863.63867
+1801.75293	923.848877	4868.3374
+1815.75952	921.359924	4873.05566
+1829.76306	918.878845	4877.79883
+1843.80884	916.387756	4882.54688
+1857.80249	913.921509	4887.33154
+1871.79224	911.462952	4892.13867
+1885.77661	909.012024	4896.96631
+1899.75745	906.568604	4901.81641
+1913.73328	904.132935	4906.68848
+1927.70459	901.70459	4911.58203
+1941.67139	899.283875	4916.49658
+1955.63428	896.870911	4921.43457
+1969.5907	894.465637	4926.39209
+1983.49634	892.085815	4931.38965
+1997.44434	889.695679	4936.39111
+2011.38794	887.313538	4941.41602
+2025.32654	884.938782	4946.46191
+2039.21301	882.59021	4951.54785
+2053.14282	880.230957	4956.6377
+2067.01904	877.897522	4961.7666
+2080.93848	875.554321	4966.90137
+2094.8042	873.236938	4972.0752
+2108.71484	870.908691	4977.25391
+2122.5708	868.607239	4982.47217
+2136.47046	866.294922	4987.69482
+2150.31641	864.009277	4992.95801
+2164.15625	861.731628	4998.24316
+2177.99146	859.461853	5003.55029
+2191.82153	857.200256	5008.88086
+2205.69482	854.928101	5014.21582
+2219.51392	852.682739	5019.5918
+2233.32666	850.445618	5024.99023
+2247.13379	848.216736	5030.41113
+2260.93555	845.995911	5035.85449
+2274.7312	843.78363	5041.32129
+2288.47217	841.598511	5046.83008
+2296.5791	840.29895	5050.04395
+2296.5791	840.29895	5050.04395
+2310.34082	838.11676	5055.58203
+2324.09985	835.944458	5061.15137
+2337.85645	833.781982	5066.75195
+2351.56177	831.648621	5072.40332
+2365.3125	829.505859	5078.06641
+2379.01123	827.392151	5083.7793
+2392.70605	825.288574	5089.52344
+2406.39746	823.194702	5095.29736
+2420.03638	821.130493	5101.12305
+2427.09717	820.061523	5104.13818
+2427.09717	820.061523	5104.13818
+2440.48682	818.275391	5110.68115
+2453.82373	816.519775	5117.27881
+2467.20825	814.755432	5123.89111
+2480.48975	813.04187	5130.58057
+2493.81885	811.319031	5137.28271
+2507.09521	809.627319	5144.04199
+2520.36816	807.946533	5150.83545
+2533.58618	806.297119	5157.68408
+2546.85059	804.638916	5164.54688
+2560.06104	803.011597	5171.46436
+2573.2168	801.415955	5178.43848
+2586.41748	799.811462	5185.4248
+2599.56348	798.238647	5192.46777
+2612.70239	796.677185	5199.54297
+2625.78735	795.147522	5206.67578
+2638.91504	793.60907	5213.81934
+2651.98535	792.102539	5221.01855
+2665.05054	790.607849	5228.25293
+2678.05664	789.145325	5235.5415
+2691.05615	787.694885	5242.86523
+2704.04736	786.25592	5250.2207
+2707.50293	785.873108	5252.17676
+2707.50293	785.873108	5252.17676
+2720.28979	784.596863	5259.89551
+2733.06787	783.333252	5267.65039
+2745.83691	782.082031	5275.43848
+2758.59692	780.843323	5283.26172
+2771.29712	779.638184	5291.14258
+2783.9873	778.445679	5299.05762
+2796.61621	777.287231	5307.03125
+2809.2854	776.120422	5315.01416
+2821.89282	774.987793	5323.05566
+2834.48877	773.868286	5331.13135
+2847.02148	772.78302	5339.26465
+2859.59302	771.689941	5347.40771
+2872.10156	770.631226	5355.60938
+2884.59717	769.58606	5363.84521
+2897.0791	768.554138	5372.11279
+2905.98584	767.833862	5378.06738
+2905.98584	767.833862	5378.06738
+2918.37598	766.852844	5386.42383
+2930.80176	765.862793	5394.78223
+2943.20947	764.886353	5403.16992
+2955.60229	763.922974	5411.58789
+2967.92432	762.995056	5420.06152
+2980.28174	762.058838	5428.53955
+2992.56689	761.157593	5437.06934
+3004.88159	760.246948	5445.59424
+3017.1709	759.348145	5454.13623
+3029.48486	758.438477	5462.66406
+3030.56445	758.35498	5463.39893
+3030.56445	758.35498	5463.39893
+3042.85107	757.455811	5471.93701
+3055.16211	756.546326	5480.46289
+3067.44434	755.648804	5489.00244
+3070.07544	755.446106	5490.7959
+3070.07544	755.446106	5490.7959
+3081.58008	755.082397	5500.42871
+3082.49463	755.05835	5501.21094
+3082.49463	755.05835	5501.21094
+3093.55054	754.960144	5511.3291
+3098.16504	754.914185	5515.53516
+-3562.89819	2345.59448	4684.9585
+-3562.89819	2345.59448	4684.9585
+-3556.52539	2334.19434	4677.5918
+-3550.15894	2322.76367	4670.23877
+-3543.78784	2311.3606	4662.87549
+-3542.44849	2308.93799	4661.33057
+-3542.44849	2308.93799	4661.33057
+-3536.07983	2297.50879	4653.97461
+-3529.70605	2286.10718	4646.60742
+-3523.32837	2274.73315	4639.23047
+-3516.97046	2263.2749	4631.89307
+-3510.61597	2251.84985	4624.55615
+-3504.27661	2240.40186	4617.24365
+-3497.96289	2228.87451	4609.97852
+-3491.65625	2217.38306	4602.71777
+-3485.37329	2205.81226	4595.50146
+-3479.09521	2194.27612	4588.2876
+-3478.56958	2193.31494	4587.68359
+-3478.56958	2193.31494	4587.68359
+-3472.31812	2181.70435	4580.51709
+-3466.08496	2170.07544	4573.37939
+-3459.87036	2158.42798	4566.27148
+-3453.68188	2146.70459	4559.20947
+-3447.50391	2135.021	4552.15723
+-3441.35303	2123.26294	4545.15381
+-3435.22095	2111.48779	4538.17871
+-3429.11572	2099.6394	4531.25244
+-3423.02124	2087.83154	4524.33496
+-3416.95312	2075.95068	4517.46533
+-3410.90503	2064.05493	4510.62598
+-3404.88354	2052.0874	4503.83398
+-3398.87305	2040.16113	4497.05127
+-3392.89038	2028.16455	4490.31836
+-3386.92676	2016.15369	4483.61377
+-3382.71069	2007.57886	4478.88574
+-3382.71069	2007.57886	4478.88574
+-3376.95044	1995.26477	4472.50977
+-3371.20117	1982.99341	4466.14355
+-3365.47803	1970.6532	4459.82422
+-3359.78149	1958.24561	4453.55176
+-3354.09692	1945.88135	4447.28955
+-3348.43872	1933.45007	4441.07422
+-3342.79907	1921.00684	4434.88623
+-3337.17896	1908.55261	4428.72803
+-3331.58618	1896.03247	4422.6167
+-3326.01221	1883.50183	4416.53369
+-3320.45679	1870.96021	4410.479
+-3314.92896	1858.35425	4404.47168
+-3309.41357	1845.79346	4398.4751
+-3303.93164	1833.11304	4392.54297
+-3298.46289	1820.479	4386.62256
+-3293.02075	1807.78101	4380.74902
+-3287.59863	1795.07434	4374.9043
+-3282.19678	1782.35962	4369.08984
+-3276.81543	1769.63672	4363.30469
+-3271.45972	1756.85095	4357.56543
+-3266.13232	1744.00391	4351.87402
+-3264.78906	1740.80676	4350.43262
+-3264.78906	1740.80676	4350.43262
+-3259.85132	1727.58276	4345.34277
+-3254.93091	1714.35046	4340.27881
+-3250.02832	1701.10974	4335.24023
+-3245.1499	1687.80725	4330.24512
+-3240.28223	1674.55029	4325.2583
+-3235.43896	1661.23218	4320.31494
+-3230.61353	1647.90613	4315.39746
+-3225.8064	1634.57288	4310.50684
+-3221.02222	1621.17834	4305.65723
+-3218.60303	1614.42615	4303.20166
+-3218.60303	1614.42615	4303.20166
+-3213.84058	1601.04663	4298.38037
+-3209.0918	1587.65808	4293

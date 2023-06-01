@@ -30,7 +30,7 @@ output_before_softmax = 0
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='/work/ws-tmp/sa058646-segment/semseg/config/voc2012/voc2012_unet_res50.yaml', help='config file')
     parser.add_argument('--testing', '-t', type=bool)
     parser.add_argument('opts', help='see config/voc2012/voc2012_unet_convnexttiny_250.yaml', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -118,7 +118,7 @@ def main():
     else:
         index_end = min(index_start + args.index_step, end)
     if args.testing:
-        test_data.data_list = test_data.data_list[index_start:index_end:2]
+        test_data.data_list = test_data.data_list[index_start:index_end:100]
     else:
         test_data.data_list = test_data.data_list[index_start:index_end]
     #if args.testing:
@@ -318,7 +318,7 @@ def net_process(model, image, mean, std=None, flip=False, image_name=None, featu
     if flip:
         input = torch.cat([input, input.flip(3)], 0)
     with torch.no_grad():
-        if args.arch=='unet':
+        if args.arch=='unet' or args.arch =='unet2':
             maps = model(input)   
             #import ipdb;ipdb.set_trace()         
             output = model.module.last.out(maps)            
@@ -500,8 +500,8 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h, c
         
         color.save(color_path)
         all_maps.append(torch.tensor(maps))#.transpose(1,2,0))
-    if args.testing:
-        power_spectra(all_maps, freq_folder)
+    #if args.testing:
+    #    power_spectra(all_maps, freq_folder)
     
 
     logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
@@ -521,6 +521,7 @@ def cal_acc(data_list, pred_folder, classes, names):
         intersection, union, target = intersectionAndUnion(pred, target, classes)
         intersection_meter.update(intersection)
         union_meter.update(union)
+        import ipdb;ipdb.set_trace()
         target_meter.update(target)
         accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)
         logger.info('Evaluating {0}/{1} on image {2}, accuracy {3:.4f}.'.format(i + 1, len(data_list), image_name+'.png', accuracy))

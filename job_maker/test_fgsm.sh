@@ -14,14 +14,19 @@ base_lr="0.0001"
 #small_conv="5"
 save_path="runs/new_exp_slak/voc2012/unet_11"
 #save_path="runs/freq_upsampling_correct/voc2012/unet"
+actual_save_path="runs/final_icml/fgsm/voc2012/unet_11"
 optimizers="adamw"
 criterion="cross_entropy"
-trans_kernel="2 7 11"
-use_convnext="False True"
-backbone_kernel="7 11"
+#trans_kernel="2 7 11"
+trans_kernel="2"
+#use_convnext="False True"
+use_convnext="False"
+#backbone_kernel="7 11"
+backbone_kernel="3"
 small_trans="3"
 small_conv="3"
-epsilon="0.0 0.05 0.1 0.15 0.2 0.25 0.3"
+#epsilon="0.0 0.05 0.1 0.15 0.2 0.25 0.3"
+epsilon="0.0 0.05 0.1 0.15 0.2 0.25 0.3 1.0 2.0 3.0 4.0 5.0"
 
 
 for epoch in $epochs
@@ -75,11 +80,13 @@ do
 		                    for eps in $epsilon
 							do
 								path="${save_path}/${net}_trans_kernel_${trans}_small_trans_${st}_convnext_backbone_${use_convx}_backbone_kernel_${bk}_small_conv_${small_conv}/model"
-		                    	folder="${save_path}/fgsm_attack_frequencies/${net}_trans_kernel_${trans}_small_trans_${st}_convnext_backbone_${use_convx}_backbone_kernel_${bk}_small_conv_${small_conv}/val/ss/eps_${eps}"
+		                    	#folder="${save_path}/high_fgsm_attack_frequencies/${net}_trans_kernel_${trans}_small_trans_${st}_convnext_backbone_${use_convx}_backbone_kernel_${bk}_small_conv_${small_conv}/val/ss/eps_${eps}"
+								folder="${actual_save_path}/correct_high_fgsm_attack/${net}_trans_kernel_${trans}_small_trans_${st}_convnext_backbone_${use_convx}_backbone_kernel_${bk}_small_conv_${small_conv}/val/ss/eps_${eps}"
 								var=$(ls ${path}| sort -V | tail -n 1)
 								model_location="${path}/${var}"
 		                    	env
-				    			sbatch -p gpu -t 23:59:59 --gres=gpu:2 --ntasks=1 --cpus-per-task=16 --mem=125G job_maker/unet_voc_fgsm.sh $net $epoch $lr $path $folder $optimizer $criteria $trans $bk $st $small_conv $use_convx $model_location $eps
+				    			#sbatch -p gpu -t 23:59:59 --gres=gpu:2 --ntasks=1 --cpus-per-task=16 --mem=125G job_maker/unet_voc_fgsm.sh $net $epoch $lr $path $folder $optimizer $criteria $trans $bk $st $small_conv $use_convx $model_location $eps
+								sbatch -p gpu -t 23:59:59 --gres=gpu:1 --ntasks=1 --cpus-per-task=16 --mem=125G job_maker/unet_fgsm.sh $net $epoch $lr $path $folder $optimizer $criteria $trans $bk $st $small_conv $use_convx $model_location $eps
 							done
 				done
 			    done

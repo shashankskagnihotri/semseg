@@ -6,6 +6,8 @@ import argparse
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import torchvision
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torch.nn.parallel
@@ -27,7 +29,7 @@ import scipy.signal as signal
 import scipy.stats as stats
 from pathlib import Path
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:24"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
 torch.cuda.empty_cache()
 
 cv2.ocl.setUseOpenCL(False)
@@ -39,8 +41,7 @@ input_folder, target_folder, fgsm_folder = "", "", ""
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    #parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
-    parser.add_argument('--config', type=str, default='/work/ws-tmp/sa058646-segment/semseg/config/voc2012/voc2012_unet_res50.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
     parser.add_argument('--testing', '-t', type=bool)
     parser.add_argument('opts', help='see config/voc2012/voc2012_unet_convnexttiny_250.yaml', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -102,6 +103,8 @@ def main():
     logger.info("Classes: {}".format(args.classes))
 
     value_scale = 255
+    args.epsilon *= value_scale
+    args.alpha *= value_scale
     mean = [0.485, 0.456, 0.406]
     mean = [item * value_scale for item in mean]
     std = [0.229, 0.224, 0.225]
@@ -112,6 +115,8 @@ def main():
     input_folder = os.path.join(args.save_folder, 'input')
     target_folder = os.path.join(args.save_folder, 'target')
     fgsm_folder = os.path.join(args.save_folder, 'segpgd')
+
+    json_results = os.path.join(args.save_folder, 'results.json')
     
     freq_folder = os.path.join(args.save_folder, 'frequency')    
     feature_folder = os.path.join(args.save_folder, 'feature_maps')
@@ -232,57 +237,70 @@ def main():
             logger.info("=> loaded checkpoint '{}'".format(args.model_path))
         else:
             raise RuntimeError("=> no checkpoint found at '{}'".format(args.model_path))
+        
+        model = nn.Sequential(torchvision.transforms.Normalize(mean, std, inplace=False), model)        
+
         test(test_loader, test_data.data_list, model, args.classes, mean, std, args.base_size, args.test_h, args.test_w, args.scales, gray_folder, color_folder, freq_folder, colors, feature_folder=feature_folder)
     if args.split != 'test':
-        cal_acc(test_data.data_list, gray_folder, args.classes, names)
+        cal_acc(test_data.data_list, gray_folder, args.classes, names, json_results=json_results)
 
-# SegPGD attack code https://arxiv.org/pdf/2207.12391.pdf
-def segpgd_attack(image, epsilon, alpha, data_grad, clip_min, clip_max):
+# FGSM attack code
+def fgsm_attack(perturbed_image, epsilon, alpha, data_grad, orig_image):
     # Collect the element-wise sign of the data gradient
     sign_data_grad = data_grad.sign()
     # Create the perturbed image by adjusting each pixel of the input image
-    perturbed_image = image + alpha*sign_data_grad
-    # Adding clipping to maintain [clean_image-epsilon, clean_image+epsilon] range
-    perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
-    # Return the perturbed image
+    perturbed_image = perturbed_image.detach() + alpha*sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    delta = torch.clamp(perturbed_image - orig_image, min=-epsilon, max=epsilon)
+    perturbed_image = torch.clamp(orig_image + delta, 0, 255).detach()
     return perturbed_image
 
 def net_process(model, image, target, crop_counter, mean, std=None, flip=False, 
-                image_name=None, feature_folder=None, iterations:int=20):    
+                image_name=None, feature_folder=None, iterations:int=20, colors=None):    
     global maps, output_before_softmax, args, outputs, input_folder, target_folder, fgsm_folder
     storing_image = np.uint8(image.copy())
-    storing_target = np.uint8(target.copy())*255
+    storing_target = np.uint8(target.copy())
+    storing_target = colorize(storing_target, colors)
     storing_image = cv2.cvtColor(storing_image, cv2.COLOR_RGB2BGR)
     input_name = input_folder + '/' + image_name + '_crop_' + str(crop_counter) + '.png'
     target_name = target_folder + '/' + image_name + '_crop_' + str(crop_counter) + '.png'
     fgsm_name = fgsm_folder + '/' + image_name + '_crop_' + str(crop_counter) + '.png'
     cv2.imwrite(input_name, storing_image)
-    cv2.imwrite(target_name, storing_target)
+    #cv2.imwrite(target_name, storing_target)
+    storing_target.save(target_name)
     input = torch.from_numpy(image.transpose((2, 0, 1))).float()
     target = torch.from_numpy(target.astype(np.int64))
     
     #print('target in net before unsqueeze: ', target.shape)
-    orig_min, orig_max = input.min(), image.max()
     
+    orig_min, orig_max = input.min(), input.max()
     epsilon = args.epsilon
     iterations = args.iterations
-    alpha = args.alpha   
+    alpha = args.alpha 
+    #import ipdb;ipdb.set_trace()  
+
+    if iterations == 1:
+        alpha = epsilon
     
-    if std is None:
-        for t, m in zip(input, mean):
-            t.sub_(m)
-    else:
-        for t, m, s in zip(input, mean, std):
-            t.sub_(m).div_(s)
+    # if std is None:
+    #     for t, m in zip(input, mean):
+    #         t.sub_(m)
+    # else:
+    #     for t, m, s in zip(input, mean, std):
+    #         t.sub_(m).div_(s)
+
     input = input.unsqueeze(0).cuda()
     target = target.unsqueeze(0).cuda()
 
-    #print('target in net after unsqueeze: ', target.shape)
-
+    shape=[input.shape[0], 21, input.shape[2], input.shape[3]]
+    target = torch.clamp(target, target.min(), 20)
+    one_hot_target = torch.nn.functional.one_hot(target, num_classes=21).permute(0,3,1,2).cuda()
     
-    #clip_min, clip_max = input.min()-epsilon, input.max()+epsilon
+    orig_image = input.clone()
+    #import ipdb;ipdb.set_trace()
+
     input = input + torch.FloatTensor(input.shape).uniform_(-1*epsilon, epsilon).cuda()
-    clip_min, clip_max = input.min(), input.max()
+    
     input.requires_grad=True
     if flip:
         input = torch.cat([input, input.flip(3)], 0)
@@ -290,36 +308,28 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
 
 
     for t in range(iterations):
-        input.retain_grad()
-        if args.arch=='unet' or args.arch =='unet2':
+        input.requires_grad=True
+        if args.arch=='unet':
             maps = model(input)            
-            output = model.module.last.out(maps)            
+            output = model[-1].module.last.out(maps)            
             maps = maps.detach().cpu()#.numpy()
         else:
-            output = model(input)
-        #plot_posterior(output[0].detach().cpu(), image_name, feature_folder)
-        #output[output<125]==0
-        #output[output>125]==1
-        #output_true=output[output==target]
-        #output_false=output[output!=target]
-        #import ipdb;ipdb.set_trace()
-        #output_logits, output_idx = torch.max(output, dim=1)
-        #output_true=output_logits[output_idx==target]
-        #output_false=output_logits[output_idx!=target]
-        #loss_true = model.module.criterion(output_true, target)
-        #loss_false = model.module.criterion(output_false, target)
-        #some_true = -(target[output_idx==target]*torch.log(F.softmax(output_true))+(1-target[output_idx==target]*torch.log(1-F.softmax(output_true))))
-        #loss_true = model.module.criterion(torch.unsqueeze(torch.unsqueeze(output_true, dim=0), dim=0), torch.unsqueeze(target[output_idx==target], dim=0))
-        #import ipdb;ipdb.set_trace()
-        #some_false = -(target[output_idx!=target]*torch.log(F.softmax(output_false))+(1-target[output_idx!=target]*torch.log(1-F.softmax(output_false))))
-        #loss_false = model.module.criterion(torch.unsqueeze(torch.unsqueeze(output_false, dim=0), dim=0), torch.unsqueeze(target[output_idx!=target], dim=0))
+            output = model(input)        
         lambda_t = t/(2*iterations)
-        loss_all = model.module.criterion(output, target)
+        loss_all = model[-1].module.criterion(output, target)
         output_idx=torch.argmax(output, dim=1)
-        loss=torch.sum(torch.where(output_idx==target, (1-lambda_t)*loss_all, lambda_t*loss_all))/(output.shape[-2]*output.shape[-1])
-        #loss = lambda_t*loss_true + (1-lambda_t)*loss_false
-        #print(loss)
-        #loss.retain_graph=True
+        #print('\toutput_idx: ', output_idx.unique())
+        if args.attack == 'segpgd':
+            output_idx=torch.argmax(output, dim=1)
+            loss=torch.sum(torch.where(output_idx==target, (1-lambda_t)*loss_all, lambda_t*loss_all))/(output.shape[-2]*output.shape[-1])
+        if args.attack == 'cospgd':
+            eps=10**-8
+            if args.sigmoid:
+                cossim=F.cosine_similarity(torch.sigmoid(output)+eps, one_hot_target+eps, dim=1, eps=10**-20)
+            else:                
+                cossim=F.cosine_similarity(torch.softmax(output, dim=1)+eps, one_hot_target+eps, dim=1, eps=10**-20)
+            loss = torch.sum((1-lambda_t)*cossim.detach()*loss_all + lambda_t*(1-cossim.detach())*loss_all)/(output.shape[-2]*output.shape[-1])
+
         model.zero_grad()
         loss = loss.mean()
         loss.backward(retain_graph=True)
@@ -329,24 +339,30 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
         except Exception:
             import ipdb;ipdb.set_trace()
 
-        input = segpgd_attack(input, epsilon, alpha, data_grad, clip_min, clip_max)
+        input = fgsm_attack(input, epsilon, alpha, data_grad, orig_image)
+        #print('PERTURBED mean: {}\t min: {}\t max: {}'.format(input.mean(), input.min(), input.max()))
+        #import ipdb;ipdb.set_trace()
+
+
     if args.arch=='unet':
         maps = model(input)            
-        output = model.module.last.out(maps)            
-        maps = maps.detach().cpu()#.numpy()
+        output = model[-1].module.last.out(maps)            
+        #maps = maps.detach().cpu()#.numpy()
     else:
         output = model(input)
 
+    #import ipdb;ipdb.set_trace()
     storing_perturbed = torch.clone(input.squeeze(0).detach().cpu())
-    for t, m, s in zip(storing_perturbed, mean, std):
-        t.mul_(s).add_(m)
+    torchvision.utils.save_image(storing_perturbed/255, fgsm_name)
+    #for t, m, s in zip(storing_perturbed, mean, std):
+    #    t.mul_(s).add_(m)    
     #storing_perturbed = transforms.ToPILImage()()
-    storing_perturbed = torch.clamp(storing_perturbed, orig_min, orig_max)
-    storing_perturbed = np.uint8(storing_perturbed.numpy().transpose(1,2,0))
+    #storing_perturbed = torch.clamp(storing_perturbed, orig_min, orig_max)
+    #storing_perturbed = np.uint8(storing_perturbed.numpy().transpose(1,2,0))
     #storing_perturbed = np.uint8(storing_perturbed[:,:,:3])
     #storing_perturbed = np.uint8(storing_perturbed)
-    storing_perturbed = cv2.cvtColor(storing_perturbed, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(fgsm_name, storing_perturbed)
+    #storing_perturbed = cv2.cvtColor(storing_perturbed, cv2.COLOR_RGB2BGR)
+    #cv2.imwrite(fgsm_name, storing_perturbed)
     #plt.imshow(transforms.ToPILImage()(perturbed_input.squeeze(0)), interpolation="bicubic")#.permute(1, 2, 0)
     #plt.savefig(fgsm_name)
 
@@ -355,7 +371,7 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
     if (h_o != h_i) or (w_o != w_i):
         output = F.interpolate(output, (h_i, w_i), mode='bilinear', align_corners=True)
     #import ipdb;ipdb.set_trace()    
-    #maps = model.module.feature_map
+    #maps = model[-1].module.feature_map
     #output_before_softmax = torch.clone(output)[0]
     output = F.softmax(output, dim=1)
     if flip:
@@ -372,7 +388,7 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
 
 def scale_process(model, image, target, classes, crop_h, crop_w, h, w, mean, 
                     std=None, stride_rate=2/3, image_name=None, 
-                    feature_folder=None):
+                    feature_folder=None, colors=None):
     ori_h, ori_w, _ = image.shape
     pad_h = max(crop_h - ori_h, 0)
     pad_w = max(crop_w - ori_w, 0)
@@ -408,7 +424,7 @@ def scale_process(model, image, target, classes, crop_h, crop_w, h, w, mean,
                                                         target_crop, crop_counter, 
                                                         mean, std, 
                                                         image_name=image_name, 
-                                                        feature_folder=feature_folder)
+                                                        feature_folder=feature_folder, colors=colors)
     prediction_crop /= np.expand_dims(count_crop, 2)
     prediction_crop = prediction_crop[pad_h_half:pad_h_half+ori_h, pad_w_half:pad_w_half+ori_w]
     prediction = cv2.resize(prediction_crop, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -443,11 +459,12 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h,
             else:
                 new_h = round(long_size/float(w)*h)
             image_scale = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            #target_scale = cv2.resize(target, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             target_scale = cv2.resize(target, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
             prediction += scale_process(model, image_scale, target_scale, classes, 
                                         crop_h, crop_w, h, w, mean, std, 
                                         image_name=image_name, 
-                                        feature_folder=feature_folder)
+                                        feature_folder=feature_folder, colors=colors)
         prediction /= len(scales)
         posterior = prediction
         prediction = np.argmax(prediction, axis=2)
@@ -463,7 +480,7 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h,
         check_makedirs(color_folder)
         check_makedirs(freq_folder)
         gray = np.uint8(prediction)
-        all_maps.append(maps)#.transpose(1,2,0))
+        #all_maps.append(maps)#.transpose(1,2,0))
         
         color = colorize(gray, colors)
         #image_path, _ = data_list[i]
@@ -481,7 +498,8 @@ def test(test_loader, data_list, model, classes, mean, std, base_size, crop_h,
     logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
 
 
-def cal_acc(data_list, pred_folder, classes, names):
+def cal_acc(data_list, pred_folder, classes, names, json_results=None):
+    global args
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()

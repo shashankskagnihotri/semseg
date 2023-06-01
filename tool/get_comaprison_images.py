@@ -15,12 +15,12 @@ from util import dataset, transform, config
 from util.util import AverageMeter, intersectionAndUnion, check_makedirs, colorize
 
 import matplotlib.pyplot as plt
-import os
 import math
 import matplotlib
 import scipy.signal as signal
 import scipy.stats as stats
 from pathlib import Path
+import glob
 
 from scipy import fftpack
 from tool import radialProfile
@@ -128,19 +128,35 @@ def main():
 def cal_acc(data_list, freq_folder, classes, names):
     across_images = []
     first = True
-    #freq_folder = freq_folder.replace('_gpu/', '/')
-    #freq_folder = freq_folder.replace('/unet/', '/unet_11_binary_plots_full_2_correct/ground_truth/')
-    #from pathlib import Path
-    #freq_folder = Path(freq_folder)
-    #freq_folder = str(freq_folder.parent.parent.parent.parent)
-    #check_makedirs(freq_folder)
-    freq_folder = "/work/ws-tmp/sa058646-segment/semseg/runs/ground_truth_images"
-    for i, (image_path, target_path) in enumerate(data_list):
-        image_name = image_path.split('/')[-1].split('.')[0]        
-        target = cv2.imread(target_path, cv2.IMREAD_GRAYSCALE) 
-        #target *= 255
-        save_name = freq_folder + '/' + image_name + '.png'        
-        cv2.imwrite(save_name, target)
+    freq_folder = freq_folder.replace('_gpu/', '/')
+    freq_folder = freq_folder.replace('/unet/', '/unet_11_binary_plots_full_2_correct/comparison/')
+    from pathlib import Path
+    
+    save_path="/work/ws-tmp/sa058646-segment/semseg/runs/new_exp_slak/voc2012/unet_11_binary_plots_full_2_correct/paper_plots/comparison_correct/"
+    ground_truth_path=glob.glob("/work/ws-tmp/sa058646-segment/semseg/runs/ground_truth_images/*.png")
+    base_line_path=glob.glob("/work/ws-tmp/sa058646-segment/semseg/runs/new_exp_slak/voc2012/unet_11_binary_plots_full_2_correct/convnext_tiny_trans_kernel_2_small_trans_0_convnext_backbone_False_backbone_kernel_3_small_conv_0/val/ss/gray/*.png")
+    trans_path=glob.glob("/work/ws-tmp/sa058646-segment/semseg/runs/new_exp_slak/voc2012/unet_11_binary_plots_full_2_correct/convnext_tiny_trans_kernel_11_small_trans_3_convnext_backbone_False_backbone_kernel_3_small_conv_0/val/ss/gray/*.png")
+    
+    for gt_path, bs_path, tr_path in zip(ground_truth_path, base_line_path, trans_path) :
+        image_name = os.path.basename(gt_path)
+        assert os.path.basename(gt_path) == os.path.basename(bs_path)
+        assert os.path.basename(gt_path) == os.path.basename(tr_path)
+        gt = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)         
+        baseline = cv2.imread(bs_path, cv2.IMREAD_GRAYSCALE)
+        trans = cv2.imread(tr_path, cv2.IMREAD_GRAYSCALE)
+        target = np.zeros((gt.shape[0],gt.shape[1],3), np.uint8)
+        #import ipdb;ipdb.set_trace()
+        for i in range(gt.shape[0]):
+            for j in range(gt.shape[1]):
+                if baseline[i][j]==gt[i][j] and trans[i][j]==gt[i][j]:
+                    target[i][j]=[255,255,255]
+                elif trans[i][j]==gt[i][j]:
+                    target[i][j]=[0,255,0]
+                elif baseline[i][j]==gt[i][j]:
+                    target[i][j]=[255,0,0]                
+
+        save_name = save_path + '/' + image_name      
+        cv2.imwrite(save_name, cv2.cvtColor(target, cv2.COLOR_RGB2BGR))
 
 
 

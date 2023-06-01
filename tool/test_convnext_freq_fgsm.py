@@ -6,6 +6,7 @@ import argparse
 import cv2
 import numpy as np
 import torch
+import torch.fft
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torch.nn.parallel
@@ -32,7 +33,8 @@ input_folder, target_folder, fgsm_folder = "", "", ""
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
+    #parser.add_argument('--config', type=str, default='config/voc2012/voc2012_unet_convnexttiny_250.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='/work/ws-tmp/sa058646-segment/semseg/config/voc2012/voc2012_unet_res50.yaml', help='config file')
     parser.add_argument('--testing', '-t', type=bool)
     parser.add_argument('opts', help='see config/voc2012/voc2012_unet_convnexttiny_250.yaml', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -279,7 +281,7 @@ def net_process(model, image, target, crop_counter, mean, std=None, flip=False,
 
     perturbed_input = fgsm_attack(input, epsilon, data_grad)
 
-    if args.arch=='unet':
+    if args.arch=='unet' or args.arch =='unet2':
         maps = model(perturbed_input)            
         output = model.module.last.out(maps)            
         maps = maps.detach().cpu()#.numpy()
@@ -381,6 +383,7 @@ def power_spectra(data, freq_path):
                 img[img<128] = 0
                 img[img>128] = 1
                 img = torch.tensor(img)
+                #print("\t\timg shape: {}".format(image.shape))
             if first:
                 freq_domain = np.expand_dims(torch.fft.fftn(img.to(d2)).detach().cpu().numpy(), axis=0)
                 first = False      
